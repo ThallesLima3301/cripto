@@ -1,0 +1,58 @@
+# Daily maintenance: evaluate matured signals/buys, prune candles.
+#
+# Runs at 06:00 UTC (03:00 BRT). The evaluate command walks every
+# signal and buy that has reached its 30-day maturation window,
+# computes returns and verdicts, prunes old candles per the
+# retention caps, and optionally VACUUMs the database.
+
+name: maintenance
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crypto-state
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout state branch
+        uses: actions/checkout@v4
+        with:
+          ref: state
+          path: .state
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state
+        env:
+          STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
+        run: bash scripts/gha_state.sh pull
+
+      - name: Evaluate
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python -m crypto_monitor.cli evaluate
+
+      - name: Push state
+        env:
+          STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
+        run: bash scripts/gha_state.sh push

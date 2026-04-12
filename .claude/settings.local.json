@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ':*)",
+      "Bash(python -m pytest --version)",
+      "Bash(python -m pip install pytest)",
+      "Bash(python -m pytest -q)",
+      "Bash(python -m pytest tests/test_ntfy_sender.py tests/test_alert_policy.py tests/test_notification_service.py -x)",
+      "Bash(python -m pytest)",
+      "Bash(python -m pytest tests/test_verdict.py tests/test_manual_buys.py tests/test_signal_evaluation.py tests/test_buy_evaluation.py)",
+      "Bash(python -m pytest tests/test_weekly_summary.py -x -q)",
+      "Bash(python -m pytest tests/test_scheduler.py -x -q)",
+      "Bash(ls c:/Users/Pichau/Desktop/cript/*.toml)",
+      "Bash(python -m pytest tests/test_cli.py -x --tb=short)",
+      "Bash(python -m pytest tests/test_cli.py --tb=short)",
+      "Bash(python -m pytest --tb=short)",
+      "Bash(python -m crypto_monitor.cli --help)",
+      "Bash(python -m pytest tests/test_cli.py -v --tb=short)",
+      "Bash(cmd.exe //c \"scripts\\\\\\\\scan.cmd\")",
+      "Bash(type logs\\\\\\\\scan.cmd.log)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(docker run:*)",
+      "Bash(openssl version:*)",
+      "Bash(openssl enc:*)",
+      "Read(//tmp/**)",
+      "Bash(rm /tmp/test.enc /tmp/test.db)",
+      "Bash(bash -n c:/Users/Pichau/Desktop/cript/scripts/gha_state.sh)",
+      "Bash(ls -la scripts/gha_state.sh .github/workflows/*.yml)"
+    ]
+  }
+}

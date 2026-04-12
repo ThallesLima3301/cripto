@@ -1,0 +1,64 @@
+# Scheduled scan: ingest candles, score signals, dispatch alerts.
+#
+# Runs every 5 minutes (GitHub Actions cron has 5–20 min jitter on
+# public repos — actual cadence is ~8–15 min, which is fine because
+# scoring anchors on hourly candle closes, not exact scan timing).
+#
+# On cold start (no prior state) the first run bootstraps ~250
+# candles per (symbol, interval) from Binance. Subsequent runs are
+# incremental.
+
+name: scan
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crypto-state
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout state branch
+        uses: actions/checkout@v4
+        with:
+          ref: state
+          path: .state
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests (pre-flight)
+        run: python -m pytest -x -q --tb=line
+
+      - name: Restore state
+        env:
+          STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
+        run: bash scripts/gha_state.sh pull
+
+      - name: Scan
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python -m crypto_monitor.cli scan
+
+      - name: Push state
+        env:
+          STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
+        run: bash scripts/gha_state.sh push

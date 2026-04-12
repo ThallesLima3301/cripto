@@ -1,0 +1,85 @@
+# Manual buy recording via the GitHub Actions UI.
+#
+# Triggered exclusively by workflow_dispatch — the user fills in the
+# input fields in the Actions tab and clicks "Run workflow". The buy
+# is recorded in the encrypted database and pushed to the state branch.
+#
+# All inputs are passed via environment variables (not shell string
+# interpolation) to avoid injection.
+
+name: buy-add
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Binance pair (e.g. BTCUSDT)"
+        required: true
+      price:
+        description: "Execution price"
+        required: true
+      amount:
+        description: "Quote-currency amount invested"
+        required: true
+      bought_at:
+        description: "ISO-8601 UTC timestamp (leave blank for now)"
+        required: false
+        default: ""
+      note:
+        description: "Free-form note (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crypto-state
+  cancel-in-progress: false
+
+jobs:
+  buy-add:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout state branch
+        uses: actions/checkout@v4
+        with:
+          ref: state
+          path: .state
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state
+        env:
+          STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
+        run: bash scripts/gha_state.sh pull
+
+      - name: Record buy
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          INPUT_SYMBOL: ${{ inputs.symbol }}
+          INPUT_PRICE: ${{ inputs.price }}
+          INPUT_AMOUNT: ${{ inputs.amount }}
+          INPUT_BOUGHT_AT: ${{ inputs.bought_at }}
+          INPUT_NOTE: ${{ inputs.note }}
+        run: |
+          args=(buy add --symbol "$INPUT_SYMBOL" --price "$INPUT_PRICE" --amount "$INPUT_AMOUNT")
+          [ -n "$INPUT_BOUGHT_AT" ] && args+=(--bought-at "$INPUT_BOUGHT_AT")
+          [ -n "$INPUT_NOTE" ] && args+=(--note "$INPUT_NOTE")
+          python -m crypto_monitor.cli "${args[@]}"
+
+      - name: Push state
+        env:
+          STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
+        run: bash scripts/gha_state.sh push

@@ -1,0 +1,122 @@
+# crypto_monitor — configuration template
+#
+# This file is the canonical source of truth for configuration defaults.
+# On first run, `python -m crypto_monitor.cli init` copies it to `config.toml`.
+# Edit your local `config.toml` for your own settings; leave this example file
+# alone unless you are changing the defaults shipped with the project.
+
+[general]
+# IANA timezone name used for quiet-hours decisions. All stored timestamps
+# remain in UTC; local time is only used at display/decision edges.
+timezone = "America/Sao_Paulo"
+# Path to the SQLite database file, relative to the project root.
+db_path = "data/crypto_monitor.db"
+# Directory where rotating log files are written, relative to the project root.
+log_dir = "logs"
+# Logging level: DEBUG, INFO, WARNING, ERROR.
+log_level = "INFO"
+
+[binance]
+base_url = "https://api.binance.com"
+request_timeout = 10
+retry_count = 3
+
+[symbols]
+# Symbols to track. Extend freely; new symbols will be seeded on next `init`
+# (or on the next scan if auto_seed = true).
+tracked = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+auto_seed = true
+
+[intervals]
+# Timeframes to ingest. v1 uses 1h for scoring, 4h for momentum/trend, 1d for long context.
+tracked = ["1h", "4h", "1d"]
+# Number of historical candles to fetch on cold start per (symbol, interval).
+bootstrap_limit = 250
+
+[scoring.weights]
+# Max points per factor. Must sum to 100 (validated at load time).
+drop_magnitude      = 25
+rsi_oversold        = 20
+relative_volume     = 15
+support_distance    = 15
+discount_from_high  = 10
+reversal_pattern    = 10
+trend_context       = 5
+
+[scoring.thresholds]
+# Minimum score required to emit any signal at all.
+min_signal_score = 50
+
+# Drop thresholds (percent) per horizon — factor 1.
+# Each `_points` array must be the same length as its corresponding threshold array.
+drop_1h          = [1.0, 2.0, 3.0]
+drop_1h_points   = [5, 8, 12]
+drop_24h         = [3.0, 5.0, 8.0, 12.0]
+drop_24h_points  = [8, 12, 18, 22]
+drop_7d          = [5.0, 10.0, 15.0, 20.0]
+drop_7d_points   = [5, 10, 18, 25]
+drop_30d         = [15.0, 25.0, 35.0, 45.0]
+drop_30d_points  = [8, 14, 18, 22]
+drop_180d        = [30.0, 45.0, 60.0, 75.0]
+drop_180d_points = [6, 10, 14, 18]
+
+# RSI thresholds — factor 2.
+rsi_1h_levels = [30, 25, 20]
+rsi_1h_points = [12, 15, 18]
+rsi_4h_levels = [35, 30, 25]
+rsi_4h_points = [5, 8, 10]
+
+# Relative volume thresholds — factor 3.
+rel_volume_levels = [1.5, 2.0, 3.0, 4.0]
+rel_volume_points = [5, 9, 12, 15]
+
+# Distance to heuristic support, in percent — factor 4. Closer = more points.
+support_distance_levels = [0.5, 1.5, 3.0, 5.0]
+support_distance_points = [15, 12, 8, 4]
+# How far back to search for swing lows (daily candles).
+support_lookback_days = 90
+
+# Discount from recent highs — factor 5 (30d + 180d blended).
+discount_30d_levels  = [10.0, 20.0]
+discount_30d_points  = [2, 5]
+discount_180d_levels = [20.0, 40.0]
+discount_180d_points = [2, 5]
+
+[scoring.severity]
+# Score thresholds for each severity tier.
+normal      = 50
+strong      = 65
+very_strong = 80
+
+[alerts]
+# Minimum minutes between alerts for the same symbol, unless overridden.
+cooldown_minutes = 120
+# If a new score exceeds the previous alert score by this many points, override cooldown.
+escalation_jump = 10
+# Quiet hours in LOCAL time (see [general].timezone). Wraps across midnight.
+quiet_hours_start = 22
+quiet_hours_end   = 8
+
+[ntfy]
+# ntfy server URL. Use https://ntfy.sh for the free public cloud service.
+server_url = "https://ntfy.sh"
+# Default tags attached to every notification.
+default_tags = ["crypto_monitor"]
+request_timeout = 10
+max_retries = 3
+
+[retention]
+# Maximum candles to keep per (symbol, interval). Older candles are pruned by
+# the daily maintenance task.
+max_candles_1h  = 2160   # ~90 days
+max_candles_4h  = 1080   # ~180 days
+max_candles_1d  = 400    # ~13 months
+# Whether to run SQLite VACUUM during maintenance.
+vacuum_on_maintenance = false
+
+[evaluation]
+# Verdict thresholds on 7-day return percent for signals and buys.
+great_return_pct = 10.0
+good_return_pct  = 5.0
+poor_return_pct  = -5.0
+bad_return_pct   = -10.0

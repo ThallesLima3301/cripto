@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+
+# Runtime data
+data/
+logs/
+
+# User config (generated from config.example.toml by `cli init`)
+config.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
