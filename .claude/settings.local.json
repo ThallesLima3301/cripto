@@ -25,7 +25,9 @@
       "Read(//tmp/**)",
       "Bash(rm /tmp/test.enc /tmp/test.db)",
       "Bash(bash -n c:/Users/Pichau/Desktop/cript/scripts/gha_state.sh)",
-      "Bash(ls -la scripts/gha_state.sh .github/workflows/*.yml)"
+      "Bash(ls -la scripts/gha_state.sh .github/workflows/*.yml)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=1\")",
+      "Bash(python -m pytest --tb=short -q)"
     ]
   }
 }

@@ -17,7 +17,7 @@ log_dir = "logs"
 log_level = "INFO"
 
 [binance]
-base_url = "https://api.binance.com"
+base_url = "https://data-api.binance.vision"
 request_timeout = 10
 retry_count = 3
 
