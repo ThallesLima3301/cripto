@@ -63,6 +63,9 @@ class SignalCandidate:
     # ---- per-factor breakdown (serialized to JSON on insert) ----
     score_breakdown: dict[str, Any] = field(default_factory=dict)
 
+    # ---- v2 regime context (None when regime feature is disabled) ----
+    regime_at_signal: str | None = None
+
     @property
     def should_emit(self) -> bool:
         """True when the candidate has a severity (score >= min_signal_score)."""

@@ -8,6 +8,7 @@ All functions in this package are:
 The signal engine in `crypto_monitor.signals` is the only consumer.
 """
 
+from crypto_monitor.indicators.atr import atr, true_range
 from crypto_monitor.indicators.patterns import (
     detect_reversal,
     is_bullish_engulfing,
@@ -24,6 +25,8 @@ __all__ = [
     "Candle",
     "SupportInfo",
     "ReversalInfo",
+    "atr",
+    "true_range",
     "rsi",
     "relative_volume",
     "ema",

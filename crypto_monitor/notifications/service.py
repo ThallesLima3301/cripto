@@ -57,9 +57,13 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable
+from typing import Any, Callable
 
 from crypto_monitor.config.settings import AlertSettings, NtfySettings
+from crypto_monitor.notifications.formatters import (
+    format_alert_body,
+    format_alert_title,
+)
 from crypto_monitor.notifications.ntfy import (
     REASON_SENT,
     SendResult,
@@ -145,7 +149,12 @@ def process_pending_signals(
         SELECT id, symbol, severity, score, candle_hour,
                price_at_signal, trigger_reason, detected_at,
                dominant_trigger_timeframe, drop_trigger_pct,
-               rsi_1h
+               rsi_1h, rsi_4h, rel_volume,
+               drop_24h_pct, drop_7d_pct, drop_30d_pct,
+               dist_support_pct, support_level_price,
+               distance_from_30d_high_pct, distance_from_180d_high_pct,
+               reversal_signal, score_breakdown,
+               regime_at_signal
         FROM signals
         WHERE alerted = 0
         ORDER BY detected_at ASC, id ASC
@@ -174,16 +183,12 @@ def process_pending_signals(
             skipped_cooldown += 1
             continue
 
-        title, body = _format_message(
-            symbol=facts.symbol,
-            severity=facts.severity,
-            score=facts.score,
-            price=row["price_at_signal"],
-            trigger_reason=row["trigger_reason"],
-            dominant_tf=row["dominant_trigger_timeframe"],
-            drop_pct=row["drop_trigger_pct"],
-            rsi_1h=row["rsi_1h"],
+        debug = ntfy.debug_notifications
+        signal_data = _row_to_dict(row)
+        title = format_alert_title(
+            facts.symbol, facts.severity, debug=debug,
         )
+        body = format_alert_body(signal_data, debug=debug)
         priority = _PRIORITY_BY_SEVERITY.get(facts.severity, "default")
         tags = tuple(ntfy.default_tags)
 
@@ -517,38 +522,27 @@ def _insert_failed_notification(
     return int(cur.lastrowid)
 
 
-def _format_message(
-    *,
-    symbol: str,
-    severity: str,
-    score: int,
-    price: float,
-    trigger_reason: str,
-    dominant_tf: str | None,
-    drop_pct: float | None,
-    rsi_1h: float | None,
-) -> tuple[str, str]:
-    """Render a short (title, body) pair for a signal.
+def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Convert a sqlite3.Row to a plain dict, extracting reversal_pattern.
 
-    Intentionally plain-text and compact — ntfy caps header size, and
-    we want the user's phone lock screen to show something readable
-    without expanding the notification. The title packs the most
-    important decision-making context into a single glanceable line:
-
-        BTCUSDT  STRONG 72  -25.9% 7d  @ 40.00
-
-    The body carries the trigger reason plus RSI if we have it, so a
-    user can tell at a glance why the signal fired.
+    The ``reversal_pattern`` field is stored inside the JSON
+    ``score_breakdown`` column. We extract it here so the formatter
+    has a flat dict to work with.
     """
-    sev_label = severity.replace("_", " ").upper()
-    title_parts = [symbol, f"{sev_label} {score}"]
-    if drop_pct is not None and dominant_tf:
-        title_parts.append(f"-{drop_pct:.1f}% {dominant_tf}")
-    title_parts.append(f"@ {price:g}")
-    title = "  ".join(title_parts)
-
-    body_parts = [trigger_reason]
-    if rsi_1h is not None:
-        body_parts.append(f"RSI1h {rsi_1h:.0f}")
-    body = " | ".join(body_parts)
-    return title, body
+    d: dict[str, Any] = dict(row)
+    # Extract reversal pattern from score_breakdown JSON.
+    breakdown_raw = d.get("score_breakdown")
+    if breakdown_raw and isinstance(breakdown_raw, str):
+        import json
+        try:
+            breakdown = json.loads(breakdown_raw)
+            rev = breakdown.get("reversal_pattern", {})
+            if isinstance(rev, dict):
+                d["reversal_pattern"] = rev.get("pattern")
+            else:
+                d["reversal_pattern"] = None
+        except (json.JSONDecodeError, TypeError):
+            d["reversal_pattern"] = None
+    else:
+        d["reversal_pattern"] = None
+    return d

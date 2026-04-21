@@ -57,6 +57,7 @@ from crypto_monitor.database.retention import (
     prune_old_candles,
     vacuum,
 )
+from crypto_monitor.database.migrations import run_migrations
 from crypto_monitor.database.schema import init_db, seed_default_symbols
 from crypto_monitor.evaluation import (
     BuyEvalReport,
@@ -76,6 +77,7 @@ from crypto_monitor.reports.weekly import (
     WeeklyRunResult,
     generate_and_send_weekly_summary,
 )
+from crypto_monitor.regime import RegimeSnapshot, classify_regime, save_regime_snapshot
 from crypto_monitor.signals.engine import score_signal
 from crypto_monitor.signals.persistence import (
     REASON_INSERTED,
@@ -84,6 +86,8 @@ from crypto_monitor.signals.persistence import (
     load_candles,
 )
 from crypto_monitor.utils.time_utils import now_utc, to_utc_iso
+
+_BTC_REGIME_SYMBOL = "BTCUSDT"
 
 
 logger = logging.getLogger(__name__)
@@ -105,6 +109,7 @@ class ScanReport:
     inserted_signals: int = 0
     signal_insert_reasons: dict[str, int] = field(default_factory=dict)
     process_report: ProcessReport | None = None
+    regime_snapshot: RegimeSnapshot | None = None
     errors: list[str] = field(default_factory=list)
 
     def summary_line(self) -> str:
@@ -202,6 +207,7 @@ def run_scan(
 
     try:
         init_db(conn)
+        run_migrations(conn)
 
         # 3. optional seeding
         if settings.symbols.auto_seed:
@@ -212,6 +218,10 @@ def run_scan(
                 logger.info(
                     "seeded %d tracked symbol(s)", report.symbols_seeded
                 )
+
+        # 3b. ensure BTC is seeded when regime is enabled
+        if settings.regime.enabled:
+            _ensure_btc_seeded(conn)
 
         # 4. flush queue
         try:
@@ -247,14 +257,39 @@ def run_scan(
             logger.exception("ingest_all_symbols failed")
             report.errors.append(f"ingest: {exc}")
 
+        # 5b. regime classification (when enabled)
+        regime: RegimeSnapshot | None = None
+        if settings.regime.enabled:
+            try:
+                regime = _classify_regime(conn, settings)
+                if regime is not None:
+                    save_regime_snapshot(conn, regime)
+                    report.regime_snapshot = regime
+                    logger.info(
+                        "regime: %s (ATR pctile=%.0f)",
+                        regime.label,
+                        regime.atr_percentile,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("regime classification failed")
+                report.errors.append(f"regime: {exc}")
+
         # 6. scoring + dedup insert
+        #    BTC is excluded from scoring when it was auto-seeded for
+        #    regime classification only (not in the user's tracked list).
+        scorable = [
+            s for s in active_symbols
+            if s != _BTC_REGIME_SYMBOL
+            or _BTC_REGIME_SYMBOL in settings.symbols.tracked
+        ]
         try:
             _score_and_persist(
                 conn,
-                symbols=active_symbols,
+                symbols=scorable,
                 settings=settings,
                 report=report,
                 detected_at=to_utc_iso(now),
+                regime=regime,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("scoring pass failed")
@@ -308,6 +343,7 @@ def run_weekly(
 
     try:
         init_db(conn)
+        run_migrations(conn)
         run = generate_and_send_weekly_summary(
             conn,
             ntfy=settings.ntfy,
@@ -354,6 +390,7 @@ def run_maintenance(
 
     try:
         init_db(conn)
+        run_migrations(conn)
 
         try:
             report.signal_eval_report = evaluate_pending_signals(
@@ -430,6 +467,48 @@ def _build_default_client(
     )
 
 
+def _ensure_btc_seeded(conn: sqlite3.Connection) -> None:
+    """Ensure BTCUSDT is in the symbols table for regime candle ingestion.
+
+    When regime is enabled, BTC daily candles must be available as a
+    first-class persisted data dependency even if the user has not
+    included BTCUSDT in ``[symbols].tracked``.  We seed it here
+    (before ingestion) so the normal ingestion pipeline picks it up.
+    Uses INSERT OR IGNORE, so it is a no-op when already present.
+    """
+    seed_default_symbols(conn, [_BTC_REGIME_SYMBOL])
+
+
+def _classify_regime(
+    conn: sqlite3.Connection,
+    settings: Settings,
+) -> RegimeSnapshot | None:
+    """Run regime classification and return a snapshot (or None).
+
+    Loads BTC 1d candles from the candles table (they are persisted
+    there by the normal ingestion pipeline after ``_ensure_btc_seeded``
+    runs before ingestion).
+
+    Returns ``None`` if classification fails due to insufficient data.
+    """
+    btc_candles_1d = load_candles(conn, _BTC_REGIME_SYMBOL, "1d", limit=250)
+    snapshot = classify_regime(
+        btc_candles_1d,
+        ema_short_period=settings.regime.ema_short_period,
+        ema_long_period=settings.regime.ema_long_period,
+        atr_period=settings.regime.atr_period,
+        atr_lookback=settings.regime.atr_lookback,
+        atr_high_percentile=settings.regime.atr_high_percentile,
+    )
+    if snapshot is None:
+        logger.warning(
+            "regime: insufficient BTC history (%d 1d candles, need %d)",
+            len(btc_candles_1d),
+            settings.regime.ema_long_period,
+        )
+    return snapshot
+
+
 def _list_active_symbols(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         """
@@ -448,6 +527,7 @@ def _score_and_persist(
     settings: Settings,
     report: ScanReport,
     detected_at: str,
+    regime: RegimeSnapshot | None = None,
 ) -> None:
     """Score every active symbol and persist any new signals.
 
@@ -461,6 +541,7 @@ def _score_and_persist(
     interval for RSI tail, etc). Loading 250 per interval is the
     same budget `load_candles`'s default uses.
     """
+    regime_label = regime.label if regime is not None else None
     for symbol in symbols:
         try:
             candles_1h = load_candles(conn, symbol, "1h", limit=250)
@@ -476,6 +557,7 @@ def _score_and_persist(
                 candles_1d,
                 settings.scoring,
                 detected_at=detected_at,
+                regime_at_signal=regime_label,
             )
             if candidate is None:
                 continue

@@ -53,6 +53,10 @@ from datetime import datetime, timedelta
 from typing import Callable, Mapping
 
 from crypto_monitor.config.settings import NtfySettings
+from crypto_monitor.notifications.formatters import (
+    format_weekly_body,
+    format_weekly_title,
+)
 from crypto_monitor.notifications.ntfy import SendResult, send_ntfy
 from crypto_monitor.utils.time_utils import now_utc, to_utc_iso
 
@@ -61,17 +65,6 @@ logger = logging.getLogger(__name__)
 
 
 WINDOW_DAYS = 7
-
-
-# Order in which severities are listed in the body. Mirrors the
-# ScoringSeverity ladder, strongest first so the interesting rows
-# hit the user's eye immediately.
-_SEVERITY_ORDER: tuple[str, ...] = ("very_strong", "strong", "normal")
-
-# Order in which verdicts are listed in the body.
-_VERDICT_ORDER: tuple[str, ...] = (
-    "great", "good", "neutral", "poor", "bad", "pending",
-)
 
 
 NtfySender = Callable[..., SendResult]
@@ -113,6 +106,7 @@ def generate_weekly_summary(
     *,
     now: datetime | None = None,
     window_days: int = WINDOW_DAYS,
+    debug: bool = False,
 ) -> WeeklySummary:
     """Build an in-memory `WeeklySummary` for the 7 days ending at `now`.
 
@@ -145,7 +139,7 @@ def generate_weekly_summary(
     )
     matured_count = sum(verdict_counts.values())
 
-    body = _render_body(
+    body = format_weekly_body(
         week_start_iso=week_start_iso,
         week_end_iso=week_end_iso,
         signal_count=signal_count,
@@ -155,6 +149,7 @@ def generate_weekly_summary(
         buy_count=buy_count,
         matured_count=matured_count,
         verdict_counts=verdict_counts,
+        debug=debug,
     )
 
     return WeeklySummary(
@@ -234,7 +229,10 @@ def send_weekly_summary(
     if row is None:
         raise ValueError(f"weekly_summary id={summary_id} not found")
 
-    title = _render_title(row["week_start"], row["week_end"])
+    title = format_weekly_title(
+        row["week_start"], row["week_end"],
+        debug=ntfy.debug_notifications,
+    )
 
     result = sender(
         ntfy,
@@ -269,7 +267,8 @@ def generate_and_send_weekly_summary(
     if now is None:
         now = now_utc()
     summary = generate_weekly_summary(
-        conn, now=now, window_days=window_days
+        conn, now=now, window_days=window_days,
+        debug=ntfy.debug_notifications,
     )
     summary_id = persist_weekly_summary(conn, summary, now=now)
     send_result = send_weekly_summary(
@@ -368,60 +367,3 @@ def _count_verdicts_matured_in_window(
     return counts
 
 
-# ---------- internals: rendering ----------
-
-def _render_title(week_start_iso: str, week_end_iso: str) -> str:
-    start = week_start_iso[:10]
-    end = week_end_iso[:10]
-    return f"Crypto weekly  {start} -> {end}"
-
-
-def _render_body(
-    *,
-    week_start_iso: str,
-    week_end_iso: str,
-    signal_count: int,
-    signal_by_severity: Mapping[str, int],
-    top_drop_symbol: str | None,
-    top_drop_pct: float | None,
-    buy_count: int,
-    matured_count: int,
-    verdict_counts: Mapping[str, int],
-) -> str:
-    """Produce a compact plain-text body for ntfy.
-
-    Kept deterministic (no timestamps) so tests can assert exact
-    substrings.
-    """
-    lines: list[str] = []
-    lines.append("Crypto weekly report")
-    lines.append(f"{week_start_iso[:10]} -> {week_end_iso[:10]} UTC")
-    lines.append("")
-
-    if signal_count == 0:
-        lines.append("Signals: 0 (quiet week)")
-    else:
-        lines.append(f"Signals: {signal_count}")
-        for sev in _SEVERITY_ORDER:
-            cnt = signal_by_severity.get(sev, 0)
-            if cnt:
-                lines.append(f"  {sev}: {cnt}")
-        if top_drop_symbol is not None and top_drop_pct is not None:
-            lines.append(
-                f"Top drop: {top_drop_symbol} -{top_drop_pct:.1f}%"
-            )
-
-    lines.append("")
-    lines.append(f"Buys logged: {buy_count}")
-    lines.append("")
-
-    if matured_count == 0:
-        lines.append("Matured this week: 0")
-    else:
-        lines.append(f"Matured this week: {matured_count}")
-        for v in _VERDICT_ORDER:
-            cnt = verdict_counts.get(v, 0)
-            if cnt:
-                lines.append(f"  {v}: {cnt}")
-
-    return "\n".join(lines)

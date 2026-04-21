@@ -159,13 +159,16 @@ def test_send_now_writes_delivered_row_and_clears_skipped_reason(
     assert row["last_error"] is None
     assert row["priority"] == "high"
 
-    # Title/body should include the formatted richer content.
+    # Title/body should include the formatted decision-oriented content.
     assert len(sender.calls) == 1
     call = sender.calls[0]
-    assert "BTCUSDT" in call["title"]
-    assert "STRONG 72" in call["title"]
-    assert "-25.9% 7d" in call["title"]
-    assert "RSI1h 12" in call["body"]
+    # Client mode: friendly name in title, decision phrase, no raw pair.
+    assert "BTC" in call["title"]
+    assert "Vale observar" in call["title"]
+    assert "BTCUSDT" not in call["title"]
+    # Body shows price, 24h variation, and reason bullets.
+    assert "BTC @" in call["body"]
+    assert "•" in call["body"]
 
 
 # ---------- queue (quiet hours) ----------
@@ -433,7 +436,8 @@ def test_flush_queue_sends_pending_rows_after_quiet_hours(
 
     # Sender saw exactly the queued row.
     assert len(sender.calls) == 1
-    assert "STRONG 72" in sender.calls[0]["title"]
+    # Queued notifications carry the decision-oriented title format.
+    assert "Vale observar" in sender.calls[0]["title"]
 
 
 def test_flush_queue_during_quiet_hours_is_a_noop(

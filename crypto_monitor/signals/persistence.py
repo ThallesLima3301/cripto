@@ -196,7 +196,8 @@ def _do_insert(
             recent_30d_high, recent_180d_high, drop_trigger_pct,
             rsi_1h, rsi_4h, rel_volume, dist_support_pct, support_level_price,
             reversal_signal, trend_context_4h, trend_context_1d,
-            score_breakdown, alerted, alert_skipped_reason
+            score_breakdown, alerted, alert_skipped_reason,
+            regime_at_signal
         ) VALUES (
             ?, ?, ?, ?,
             ?, ?, ?, ?,
@@ -205,7 +206,8 @@ def _do_insert(
             ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?,
-            ?, 0, NULL
+            ?, 0, NULL,
+            ?
         )
         """,
         (
@@ -236,5 +238,6 @@ def _do_insert(
             candidate.trend_context_4h,
             candidate.trend_context_1d,
             json.dumps(candidate.score_breakdown, sort_keys=True, default=str),
+            candidate.regime_at_signal,
         ),
     )

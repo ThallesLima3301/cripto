@@ -181,10 +181,10 @@ def test_generate_empty_week_has_zero_counts(memory_db):
     # Window: 7d ending at now, half-open.
     assert summary.week_end == "2026-04-11T12:00:00Z"
     assert summary.week_start == "2026-04-04T12:00:00Z"
-    # Body still mentions the window and a quiet-week marker.
-    assert "2026-04-04" in summary.body
-    assert "2026-04-11" in summary.body
-    assert "quiet week" in summary.body
+    # Body still mentions the quiet-week marker (in Portuguese).
+    assert "semana tranquila" in summary.body
+    # Always includes a final conclusion line.
+    assert "Leitura rápida:" in summary.body
 
 
 def test_generate_counts_signals_in_window_and_breaks_down_by_severity(memory_db):
@@ -302,7 +302,7 @@ def test_generate_counts_buys_in_window(memory_db):
 
     summary = generate_weekly_summary(memory_db, now=now)
     assert summary.buy_count == 2
-    assert "Buys logged: 2" in summary.body
+    assert "Compras registradas: 2" in summary.body
 
 
 def test_generate_aggregates_matured_verdicts_from_both_tables(memory_db):
@@ -390,15 +390,17 @@ def test_generate_body_contains_key_facts(memory_db):
     summary = generate_weekly_summary(memory_db, now=now)
     body = summary.body
 
-    assert "Crypto weekly report" in body
-    assert "2026-04-04" in body and "2026-04-11" in body
-    assert "Signals: 2" in body
-    assert "very_strong: 1" in body
-    assert "strong: 1" in body
-    assert "Top drop: BTCUSDT -8.2%" in body
-    assert "Buys logged: 1" in body
-    # No matured evaluations → zero line.
-    assert "Matured this week: 0" in body
+    assert "📊 Resumo da semana" in body
+    assert "Sinais emitidos: 2" in body
+    assert "Críticos: 1" in body
+    assert "Fortes: 1" in body
+    # Top drop uses friendly name + dd/MM formatting.
+    assert "Maior queda: BTC (-8.2%)" in body
+    assert "Compras registradas: 1" in body
+    # No matured evaluations → the "Avaliações vencidas" section is omitted entirely.
+    assert "Avaliações vencidas" not in body
+    # Conclusion line is always present.
+    assert "Leitura rápida:" in body
 
 
 # ---------- persist ----------
@@ -451,9 +453,10 @@ def test_send_weekly_summary_success_marks_sent(memory_db, ntfy_settings):
     assert result.sent is True
     assert len(sender.calls) == 1
     call = sender.calls[0]
-    # Title carries the window; body is the persisted body.
-    assert "2026-04-04" in call.title
-    assert "2026-04-11" in call.title
+    # Title carries the window in dd/MM format; body is the persisted body.
+    assert "04/04" in call.title
+    assert "11/04" in call.title
+    assert "Resumo semanal" in call.title
     assert call.body == summary.body
     assert call.priority == "default"
     assert "weekly" in call.tags

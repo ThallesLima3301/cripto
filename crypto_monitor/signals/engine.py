@@ -53,8 +53,13 @@ def score_signal(
     scoring: ScoringSettings,
     *,
     detected_at: str | None = None,
+    regime_at_signal: str | None = None,
 ) -> SignalCandidate | None:
-    """Score a symbol and return a candidate, or None if no 1h data."""
+    """Score a symbol and return a candidate, or None if no 1h data.
+
+    Parameters added by v2 (backward-compatible defaults):
+      *regime_at_signal* — stamped on the candidate for analytics.
+    """
     if not candles_1h:
         return None
 
@@ -166,6 +171,7 @@ def score_signal(
         trend_context_4h=trend_4h,
         trend_context_1d=trend_1d,
         score_breakdown=breakdown,
+        regime_at_signal=regime_at_signal,
     )
 
 
@@ -252,7 +258,10 @@ def _compute_highs_and_discounts(
     return out
 
 
-def _severity_for(score: int, scoring: ScoringSettings) -> str | None:
+def _severity_for(
+    score: int,
+    scoring: ScoringSettings,
+) -> str | None:
     """Map a numeric score to a severity tier, or None if below threshold."""
     s = scoring.severity
     if score < scoring.thresholds.min_signal_score:

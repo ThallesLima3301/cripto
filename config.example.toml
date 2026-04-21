@@ -104,6 +104,9 @@ server_url = "https://ntfy.sh"
 default_tags = ["crypto_monitor"]
 request_timeout = 10
 max_retries = 3
+# When true, notifications include a raw debug block after the
+# human-readable text (scores, all indicator values, regime label).
+debug_notifications = false
 
 [retention]
 # Maximum candles to keep per (symbol, interval). Older candles are pruned by
@@ -120,3 +123,18 @@ great_return_pct = 10.0
 good_return_pct  = 5.0
 poor_return_pct  = -5.0
 bad_return_pct   = -10.0
+
+[regime]
+# Market regime filter based on BTC daily candles.
+# When enabled, BTC EMA alignment + ATR volatility determine a macro
+# regime label (risk_on / neutral / risk_off) that adjusts the minimum
+# signal score threshold.  BTC daily candles are ingested automatically
+# even if BTCUSDT is not in [symbols].tracked.
+enabled = false
+ema_short_period = 20
+ema_long_period  = 50
+atr_period       = 14
+atr_lookback     = 90
+atr_high_percentile      = 70.0
+threshold_adjust_risk_on  = -5
+threshold_adjust_risk_off = 5

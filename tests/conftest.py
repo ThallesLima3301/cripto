@@ -18,6 +18,7 @@ from crypto_monitor.config.settings import (
     ScoringWeights,
 )
 from crypto_monitor.database.connection import get_connection
+from crypto_monitor.database.migrations import run_migrations
 from crypto_monitor.database.schema import init_db
 from crypto_monitor.indicators import Candle
 
@@ -94,9 +95,14 @@ def scoring_settings() -> ScoringSettings:
 
 @pytest.fixture
 def memory_db():
-    """Fresh in-memory SQLite database with the v1 schema applied."""
+    """Fresh in-memory SQLite database with the full schema applied.
+
+    Runs both ``init_db`` (baseline tables) and ``run_migrations``
+    (incremental deltas) so every test sees the latest schema.
+    """
     conn = get_connection(":memory:")
     init_db(conn)
+    run_migrations(conn)
     try:
         yield conn
     finally:
@@ -126,6 +132,7 @@ def ntfy_settings() -> NtfySettings:
         default_tags=("crypto", "v1"),
         request_timeout=5,
         max_retries=2,
+        debug_notifications=False,
     )
 
 
@@ -157,4 +164,5 @@ def ntfy_settings_missing_topic() -> NtfySettings:
         default_tags=("crypto",),
         request_timeout=5,
         max_retries=2,
+        debug_notifications=False,
     )

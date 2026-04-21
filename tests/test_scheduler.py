@@ -34,6 +34,7 @@ from crypto_monitor.config.settings import (
     BinanceSettings,
     GeneralSettings,
     IntervalsSettings,
+    RegimeSettings,
     RetentionSettings,
     Settings,
     SymbolsSettings,
@@ -171,6 +172,16 @@ def _make_settings(
             vacuum_on_maintenance=vacuum_on_maintenance,
         ),
         evaluation=eval_settings,
+        regime=RegimeSettings(
+            enabled=False,
+            ema_short_period=20,
+            ema_long_period=50,
+            atr_period=14,
+            atr_lookback=90,
+            atr_high_percentile=70.0,
+            threshold_adjust_risk_on=-5,
+            threshold_adjust_risk_off=5,
+        ),
     )
 
 

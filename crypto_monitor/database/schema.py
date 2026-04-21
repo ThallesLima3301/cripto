@@ -30,10 +30,12 @@ from __future__ import annotations
 
 import sqlite3
 
+from crypto_monitor.database.migrations import BASELINE_VERSION
 from crypto_monitor.utils.time_utils import now_utc, to_utc_iso
 
 
-SCHEMA_VERSION = 1
+# Re-export so existing `from schema import SCHEMA_VERSION` still works.
+SCHEMA_VERSION = BASELINE_VERSION
 
 
 # ---------- table DDL ----------

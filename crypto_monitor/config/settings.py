@@ -122,6 +122,7 @@ class NtfySettings:
     default_tags: tuple[str, ...]
     request_timeout: int
     max_retries: int
+    debug_notifications: bool
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,23 @@ class EvaluationSettings:
 
 
 @dataclass(frozen=True)
+class RegimeSettings:
+    """Market regime filter configuration.
+
+    When ``enabled`` is False the entire regime subsystem is skipped and
+    no BTC candles are fetched for regime purposes.
+    """
+    enabled: bool
+    ema_short_period: int
+    ema_long_period: int
+    atr_period: int
+    atr_lookback: int
+    atr_high_percentile: float
+    threshold_adjust_risk_on: int
+    threshold_adjust_risk_off: int
+
+
+@dataclass(frozen=True)
 class Settings:
     project_root: Path
     general: GeneralSettings
@@ -152,6 +170,7 @@ class Settings:
     ntfy: NtfySettings
     retention: RetentionSettings
     evaluation: EvaluationSettings
+    regime: RegimeSettings
 
 
 # ---------- loader ----------
@@ -306,6 +325,7 @@ def load_settings(project_root: Path) -> Settings:
         default_tags=tuple(nt.get("default_tags", [])),
         request_timeout=int(nt["request_timeout"]),
         max_retries=int(nt["max_retries"]),
+        debug_notifications=bool(nt.get("debug_notifications", False)),
     )
 
     rt = _require(raw, "retention")
@@ -324,6 +344,19 @@ def load_settings(project_root: Path) -> Settings:
         bad_return_pct=float(ev["bad_return_pct"]),
     )
 
+    # Optional v2 sections — absent sections default to feature-disabled.
+    rg = raw.get("regime", {})
+    regime = RegimeSettings(
+        enabled=bool(rg.get("enabled", False)),
+        ema_short_period=int(rg.get("ema_short_period", 20)),
+        ema_long_period=int(rg.get("ema_long_period", 50)),
+        atr_period=int(rg.get("atr_period", 14)),
+        atr_lookback=int(rg.get("atr_lookback", 90)),
+        atr_high_percentile=float(rg.get("atr_high_percentile", 70.0)),
+        threshold_adjust_risk_on=int(rg.get("threshold_adjust_risk_on", -5)),
+        threshold_adjust_risk_off=int(rg.get("threshold_adjust_risk_off", 5)),
+    )
+
     return Settings(
         project_root=project_root,
         general=general,
@@ -335,4 +368,5 @@ def load_settings(project_root: Path) -> Settings:
         ntfy=ntfy,
         retention=retention,
         evaluation=evaluation,
+        regime=regime,
     )
