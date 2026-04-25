@@ -50,6 +50,16 @@ class SignalEvalResult:
     All percent fields are absolute percent differences, signed:
     positive = up, negative = down. `max_gain_7d_pct` is always
     >= 0 and `max_loss_7d_pct` is always <= 0.
+
+    Block 24 added two timing fields:
+
+      * ``time_to_mfe_hours`` — hours from ``candle_hour`` to the
+        open_time of the 1h bar that produced the maximum favorable
+        excursion (MFE) inside the 7d window.
+      * ``time_to_mae_hours`` — same for MAE.
+
+    Both stay ``None`` when the window has no candles. Tie-breaking
+    is "earliest first" so the timing is stable across reruns.
     """
     signal_id: int
     price_at_signal: float
@@ -62,6 +72,8 @@ class SignalEvalResult:
     max_gain_7d_pct: float | None
     max_loss_7d_pct: float | None
     verdict: str
+    time_to_mfe_hours: float | None = None
+    time_to_mae_hours: float | None = None
 
 
 @dataclass(frozen=True)
@@ -212,7 +224,7 @@ def _compute_signal_eval(
     ret_7d = _pct_change(price_at_signal, price_7d)
     ret_30d = _pct_change(price_at_signal, price_30d)
 
-    max_gain_pct, max_loss_pct = _max_gain_loss_window(
+    max_gain_pct, max_loss_pct, t_to_mfe, t_to_mae = _max_gain_loss_with_timing(
         conn,
         symbol=symbol,
         start=candle_anchor,
@@ -234,6 +246,8 @@ def _compute_signal_eval(
         max_gain_7d_pct=max_gain_pct,
         max_loss_7d_pct=max_loss_pct,
         verdict=verdict,
+        time_to_mfe_hours=t_to_mfe,
+        time_to_mae_hours=t_to_mae,
     )
 
 
@@ -265,7 +279,7 @@ def _price_at_or_after(
     return float(row["close"])
 
 
-def _max_gain_loss_window(
+def _max_gain_loss_with_timing(
     conn: sqlite3.Connection,
     *,
     symbol: str,
@@ -273,31 +287,63 @@ def _max_gain_loss_window(
     end: datetime,
     base: float,
     interval: str = "1h",
-) -> tuple[float | None, float | None]:
-    """Return (max_gain_pct, max_loss_pct) over [start, end] inclusive.
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Return ``(max_gain_pct, max_loss_pct, t_to_mfe_h, t_to_mae_h)``.
 
-    Uses the max HIGH and min LOW across the 1h candles in the
-    window, which matches the wording we promised: hourly-resolution
-    high and low, not tick-level.
+    Walks every 1h candle in ``[start, end]`` and tracks both the
+    highest ``high`` (MFE) and the lowest ``low`` (MAE) along with the
+    ``open_time`` of the bar that produced each. The timing values are
+    floats giving the number of hours from ``start`` to that bar. Ties
+    on the extreme value are broken by **earliest first** so reruns
+    are deterministic and the bookkeeping is intuitive ("first time
+    we hit that level").
+
+    All four values are ``None`` when the window has no candles —
+    the caller surfaces the empty result as NULL columns. The
+    base-relative gain/loss percentages keep the existing semantics:
+    ``max_gain_pct >= 0`` and ``max_loss_pct <= 0`` whenever the
+    window had any data.
     """
     start_iso = to_utc_iso(start)
     end_iso = to_utc_iso(end)
-    row = conn.execute(
+    rows = conn.execute(
         """
-        SELECT MAX(high) AS hi, MIN(low) AS lo
-        FROM candles
+        SELECT open_time, high, low FROM candles
         WHERE symbol = ? AND interval = ?
           AND open_time >= ? AND open_time <= ?
+        ORDER BY open_time ASC
         """,
         (symbol, interval, start_iso, end_iso),
-    ).fetchone()
-    if row is None or row["hi"] is None or row["lo"] is None:
-        return (None, None)
-    hi = float(row["hi"])
-    lo = float(row["lo"])
-    max_gain_pct = (hi - base) / base * 100.0
-    max_loss_pct = (lo - base) / base * 100.0
-    return (max_gain_pct, max_loss_pct)
+    ).fetchall()
+    if not rows:
+        return (None, None, None, None)
+
+    hi_pct: float | None = None
+    hi_time: datetime | None = None
+    lo_pct: float | None = None
+    lo_time: datetime | None = None
+    for r in rows:
+        bar_time = from_utc_iso(r["open_time"])
+        gain_pct = (float(r["high"]) - base) / base * 100.0
+        loss_pct = (float(r["low"]) - base) / base * 100.0
+        # Earliest-first tie-breaking: strict comparison keeps the
+        # first occurrence when later bars match the extreme exactly.
+        if hi_pct is None or gain_pct > hi_pct:
+            hi_pct = gain_pct
+            hi_time = bar_time
+        if lo_pct is None or loss_pct < lo_pct:
+            lo_pct = loss_pct
+            lo_time = bar_time
+
+    t_to_mfe = (
+        (hi_time - start).total_seconds() / 3600.0
+        if hi_time is not None else None
+    )
+    t_to_mae = (
+        (lo_time - start).total_seconds() / 3600.0
+        if lo_time is not None else None
+    )
+    return (hi_pct, lo_pct, t_to_mfe, t_to_mae)
 
 
 def _pct_change(base: float, later: float | None) -> float | None:
@@ -319,8 +365,9 @@ def _insert_signal_evaluation(
             signal_id, evaluated_at, price_at_signal,
             price_24h_later, price_7d_later, price_30d_later,
             return_24h_pct, return_7d_pct, return_30d_pct,
-            max_gain_7d_pct, max_loss_7d_pct, verdict
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            max_gain_7d_pct, max_loss_7d_pct, verdict,
+            time_to_mfe_hours, time_to_mae_hours
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             r.signal_id,
@@ -335,5 +382,7 @@ def _insert_signal_evaluation(
             r.max_gain_7d_pct,
             r.max_loss_7d_pct,
             r.verdict,
+            r.time_to_mfe_hours,
+            r.time_to_mae_hours,
         ),
     )

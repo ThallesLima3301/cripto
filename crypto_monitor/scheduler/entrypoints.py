@@ -42,6 +42,7 @@ connection, it closes it on the way out, even on error.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sqlite3
 from dataclasses import dataclass, field
@@ -78,6 +79,7 @@ from crypto_monitor.reports.weekly import (
     generate_and_send_weekly_summary,
 )
 from crypto_monitor.regime import RegimeSnapshot, classify_regime, save_regime_snapshot
+from crypto_monitor.sell.runtime import ProcessSellReport, process_open_positions
 from crypto_monitor.signals.engine import score_signal
 from crypto_monitor.signals.persistence import (
     REASON_INSERTED,
@@ -86,6 +88,17 @@ from crypto_monitor.signals.persistence import (
     load_candles,
 )
 from crypto_monitor.utils.time_utils import now_utc, to_utc_iso
+from crypto_monitor.watchlist import (
+    EXPIRE,
+    PROMOTE,
+    WATCH,
+    decide_watch_action,
+    expire_below_floor,
+    expire_stale,
+    get_watching,
+    promote,
+    upsert_watching,
+)
 
 _BTC_REGIME_SYMBOL = "BTCUSDT"
 
@@ -100,6 +113,16 @@ BinanceClientFactory = Callable[[], BinanceClient]
 # ---------- report dataclasses ----------
 
 @dataclass
+class WatchlistReport:
+    """Summary of one scan-cycle's watchlist activity."""
+    watched: int = 0      # WATCH actions taken (insert + refresh)
+    promoted: int = 0     # PROMOTE actions that successfully inserted
+    expired_below_floor: int = 0
+    expired_stale: int = 0
+    ignored: int = 0
+
+
+@dataclass
 class ScanReport:
     """Summary of a `run_scan` run, collected for log output."""
     symbols_seeded: int = 0
@@ -110,6 +133,8 @@ class ScanReport:
     signal_insert_reasons: dict[str, int] = field(default_factory=dict)
     process_report: ProcessReport | None = None
     regime_snapshot: RegimeSnapshot | None = None
+    sell_report: ProcessSellReport | None = None
+    watchlist_report: WatchlistReport | None = None
     errors: list[str] = field(default_factory=list)
 
     def summary_line(self) -> str:
@@ -124,11 +149,25 @@ class ScanReport:
         failed = (
             self.process_report.send_failed if self.process_report else 0
         )
+        sell = self.sell_report
+        sell_part = (
+            f" sell_emitted={sell.signals_emitted} sell_sent={sell.signals_sent} "
+            f"sell_cooldown={sell.cooldown_suppressed}"
+            if sell is not None
+            else ""
+        )
+        wl = self.watchlist_report
+        wl_part = (
+            f" wl_watched={wl.watched} wl_promoted={wl.promoted} "
+            f"wl_expired={wl.expired_below_floor + wl.expired_stale}"
+            if wl is not None
+            else ""
+        )
         return (
             f"scan ingest={ingest_total} scored={self.scored_symbols} "
             f"inserted={self.inserted_signals} "
             f"sent={processed} queued={queued} "
-            f"cooldown={cd} failed={failed} "
+            f"cooldown={cd} failed={failed}{sell_part}{wl_part} "
             f"errors={len(self.errors)}"
         )
 
@@ -282,18 +321,50 @@ def run_scan(
             if s != _BTC_REGIME_SYMBOL
             or _BTC_REGIME_SYMBOL in settings.symbols.tracked
         ]
+        # Initialize the watchlist report up front when the feature is
+        # on so the scoring loop has somewhere to record its decisions.
+        if settings.watchlist.enabled:
+            report.watchlist_report = WatchlistReport()
+            try:
+                report.watchlist_report.expired_stale = expire_stale(
+                    conn, now=now,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("watchlist expire_stale failed")
+                report.errors.append(f"watchlist: {exc}")
+
         try:
             _score_and_persist(
                 conn,
                 symbols=scorable,
                 settings=settings,
                 report=report,
-                detected_at=to_utc_iso(now),
+                now=now,
                 regime=regime,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("scoring pass failed")
             report.errors.append(f"scoring: {exc}")
+
+        # 6b. sell-side pass (evaluate open buys, insert + notify sells)
+        if settings.sell.enabled:
+            try:
+                regime_label_for_sell = (
+                    regime.label if regime is not None else None
+                )
+                report.sell_report = process_open_positions(
+                    conn,
+                    settings=settings.sell,
+                    ntfy=settings.ntfy,
+                    regime_label=regime_label_for_sell,
+                    now=now,
+                    sender=sender,
+                )
+                if report.sell_report.errors:
+                    report.errors.extend(report.sell_report.errors)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("process_open_positions failed")
+                report.errors.append(f"sell: {exc}")
 
         # 7. alert processing
         try:
@@ -509,6 +580,27 @@ def _classify_regime(
     return snapshot
 
 
+def _regime_min_score_adjust(
+    regime: RegimeSnapshot | None,
+    settings: Settings,
+) -> int:
+    """Return the emit-threshold adjustment for the current regime.
+
+    ``risk_on``  -> ``settings.regime.threshold_adjust_risk_on``  (typically negative,
+                    lowering the bar so more borderline signals emit).
+    ``risk_off`` -> ``settings.regime.threshold_adjust_risk_off`` (typically positive,
+                    raising the bar so only stronger signals emit).
+    Anything else (``neutral``, ``None``, regime feature disabled) -> 0.
+    """
+    if regime is None or not settings.regime.enabled:
+        return 0
+    if regime.label == "risk_on":
+        return settings.regime.threshold_adjust_risk_on
+    if regime.label == "risk_off":
+        return settings.regime.threshold_adjust_risk_off
+    return 0
+
+
 def _list_active_symbols(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         """
@@ -526,7 +618,7 @@ def _score_and_persist(
     symbols: list[str],
     settings: Settings,
     report: ScanReport,
-    detected_at: str,
+    now: datetime,
     regime: RegimeSnapshot | None = None,
 ) -> None:
     """Score every active symbol and persist any new signals.
@@ -536,12 +628,25 @@ def _score_and_persist(
     together. Per-symbol errors are isolated so a single bad feed
     doesn't abort the whole scan.
 
+    Block 23 added the watchlist branch: when ``settings.watchlist.enabled``
+    is True and the candidate's severity is None (the regular emit path
+    declined), the manager decides one of WATCH/PROMOTE/EXPIRE/IGNORE.
+    PROMOTE synthesizes a severity from ``ScoringSeverity`` and re-runs
+    through ``insert_signal`` so dedup, breakdown, and downstream alerts
+    behave identically to a regular signal — but the row carries a
+    ``watchlist_id`` linking back to the originating watch.
+
     We only need enough history to satisfy the longest lookback the
     engine might touch (180d on the 1d interval, 30d on the 1h
     interval for RSI tail, etc). Loading 250 per interval is the
     same budget `load_candles`'s default uses.
     """
+    detected_at = to_utc_iso(now)
     regime_label = regime.label if regime is not None else None
+    min_score_adjust = _regime_min_score_adjust(regime, settings)
+    base_min_score = settings.scoring.thresholds.min_signal_score
+    wl_enabled = settings.watchlist.enabled
+
     for symbol in symbols:
         try:
             candles_1h = load_candles(conn, symbol, "1h", limit=250)
@@ -558,17 +663,134 @@ def _score_and_persist(
                 settings.scoring,
                 detected_at=detected_at,
                 regime_at_signal=regime_label,
+                min_score_adjust=min_score_adjust,
             )
             if candidate is None:
                 continue
             report.scored_symbols += 1
 
-            result: InsertResult = insert_signal(conn, candidate)
-            report.signal_insert_reasons[result.reason] = (
-                report.signal_insert_reasons.get(result.reason, 0) + 1
+            if candidate.severity is not None:
+                # Regular emit path — unchanged behavior.
+                result: InsertResult = insert_signal(conn, candidate)
+                _record_insert_outcome(report, result)
+                continue
+
+            # Watchlist branch — runs only when the regular signal
+            # didn't emit AND the feature is on. Disabled-watchlist
+            # behavior matches pre-Block-23 exactly.
+            if not wl_enabled:
+                continue
+
+            _handle_watchlist_decision(
+                conn,
+                candidate=candidate,
+                settings=settings,
+                report=report,
+                now=now,
+                base_min_score=base_min_score,
             )
-            if result.inserted:
-                report.inserted_signals += 1
         except Exception as exc:  # noqa: BLE001
             logger.exception("scoring failed for %s", symbol)
             report.errors.append(f"score {symbol}: {exc}")
+
+
+def _record_insert_outcome(report: ScanReport, result: InsertResult) -> None:
+    """Bump per-reason counters and `inserted_signals` from one InsertResult."""
+    report.signal_insert_reasons[result.reason] = (
+        report.signal_insert_reasons.get(result.reason, 0) + 1
+    )
+    if result.inserted:
+        report.inserted_signals += 1
+
+
+def _handle_watchlist_decision(
+    conn: sqlite3.Connection,
+    *,
+    candidate,
+    settings: Settings,
+    report: ScanReport,
+    now: datetime,
+    base_min_score: int,
+) -> None:
+    """Apply the watchlist state machine to a borderline candidate.
+
+    Called only when ``candidate.severity is None`` and the watchlist
+    feature is enabled. Updates ``report.watchlist_report`` counters
+    and mutates the ``watchlist`` table via the store helpers.
+    """
+    wl_report = report.watchlist_report
+    assert wl_report is not None  # the caller ensures it exists
+
+    has_active = get_watching(conn, symbol=candidate.symbol) is not None
+    action = decide_watch_action(
+        score=candidate.score,
+        min_signal_score=base_min_score,
+        floor_score=settings.watchlist.floor_score,
+        has_active_watch=has_active,
+    )
+
+    if action == WATCH:
+        upsert_watching(
+            conn,
+            symbol=candidate.symbol,
+            score=candidate.score,
+            now=now,
+            max_watch_hours=settings.watchlist.max_watch_hours,
+        )
+        wl_report.watched += 1
+        return
+
+    if action == EXPIRE:
+        if expire_below_floor(conn, symbol=candidate.symbol, now=now):
+            wl_report.expired_below_floor += 1
+        return
+
+    if action == PROMOTE:
+        watch = get_watching(conn, symbol=candidate.symbol)
+        promoted_severity = _severity_for_score(
+            candidate.score, settings.scoring.severity,
+        )
+        if promoted_severity is None:
+            # Defensive: PROMOTE means score >= min_signal_score, and
+            # the default config has severity.normal == min_signal_score
+            # so this branch shouldn't trigger. If a custom config makes
+            # severity.normal > min_signal_score we silently skip.
+            return
+        promoted_candidate = dataclasses.replace(
+            candidate,
+            severity=promoted_severity,
+            watchlist_id=(watch.id if watch is not None else None),
+        )
+        result: InsertResult = insert_signal(conn, promoted_candidate)
+        _record_insert_outcome(report, result)
+        if result.inserted and watch is not None and result.signal_id is not None:
+            promote(
+                conn,
+                symbol=candidate.symbol,
+                signal_id=result.signal_id,
+                now=now,
+            )
+            wl_report.promoted += 1
+        return
+
+    # IGNORE — nothing to record beyond the counter.
+    wl_report.ignored += 1
+
+
+def _severity_for_score(
+    score: int,
+    severity_cfg,
+) -> str | None:
+    """Map a raw score to a severity tier (no min-score gate).
+
+    Used by the PROMOTE branch — the watchlist already established
+    that the score warrants a signal, so we skip the emit-floor check
+    that ``signals.engine._severity_for`` performs.
+    """
+    if score >= severity_cfg.very_strong:
+        return "very_strong"
+    if score >= severity_cfg.strong:
+        return "strong"
+    if score >= severity_cfg.normal:
+        return "normal"
+    return None

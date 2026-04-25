@@ -53,9 +53,13 @@ def bare_db():
 def _clean_migrations(monkeypatch):
     """Ensure test migrations don't leak between tests.
 
-    Saves and restores the global _MIGRATIONS dict around each test.
+    Saves the real registry, *clears it for the test body* so each test
+    sees only the migrations it explicitly registers, and restores the
+    originals on teardown. Without the clear, a test that registers a
+    synthetic v2 would still pick up every real migration at v3+.
     """
     original = dict(_MIGRATIONS)
+    _MIGRATIONS.clear()
     yield
     _MIGRATIONS.clear()
     _MIGRATIONS.update(original)

@@ -537,3 +537,105 @@ def test_generate_and_send_weekly_summary_end_to_end(memory_db, ntfy_settings):
     # Sender was called exactly once with the persisted body.
     assert len(sender.calls) == 1
     assert sender.calls[0].body == run.summary.body
+
+
+# ---------- Block 26: analytics integration ----------
+
+def _seed_eval(
+    conn,
+    *,
+    symbol: str,
+    detected_at: datetime,
+    return_pct: float,
+    score: int = 70,
+    severity: str = "strong",
+) -> None:
+    """Insert a signal + a matching signal_evaluation row.
+
+    The analytics loader filters by ``signals.detected_at`` so the
+    timestamp here drives the 90d window inclusion.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO signals (
+            symbol, detected_at, candle_hour, price_at_signal,
+            score, severity, trigger_reason, reversal_signal,
+            score_breakdown, dominant_trigger_timeframe,
+            regime_at_signal
+        ) VALUES (?, ?, ?, 100.0, ?, ?, 'test', 0, '{}', '7d', 'neutral')
+        """,
+        (symbol, _iso(detected_at), _iso(detected_at), score, severity),
+    )
+    sig_id = int(cur.lastrowid)
+    conn.execute(
+        """
+        INSERT INTO signal_evaluations (
+            signal_id, evaluated_at, price_at_signal,
+            return_7d_pct, max_gain_7d_pct, max_loss_7d_pct,
+            time_to_mfe_hours, time_to_mae_hours, verdict
+        ) VALUES (?, ?, 100.0, ?, ?, ?, 24.0, 48.0, 'good')
+        """,
+        (
+            sig_id,
+            _iso(detected_at + timedelta(days=30)),
+            return_pct, return_pct + 5.0, return_pct - 5.0,
+        ),
+    )
+    conn.commit()
+
+
+def test_weekly_body_omits_rich_analytics_when_data_below_threshold(memory_db):
+    """Fewer than 5 evaluated rows -> body still appended an Análise
+    section, but with the 'dados insuficientes' wording."""
+    now = datetime(2026, 4, 23, 12, 0, tzinfo=UTC)
+    # Three matured rows is below MIN_ANALYTICS_FOR_WEEKLY=5.
+    for i in range(3):
+        _seed_eval(
+            memory_db,
+            symbol=f"X{i}USDT",
+            detected_at=now - timedelta(days=40 + i),
+            return_pct=5.0,
+        )
+    summary = generate_weekly_summary(memory_db, now=now)
+    assert "Análise" in summary.body
+    assert "dados insuficientes" in summary.body.lower()
+    # Rich one-liner markers should NOT be present.
+    assert "WR " not in summary.body
+    assert "PF " not in summary.body
+
+
+def test_weekly_body_includes_analytics_section_with_enough_data(memory_db):
+    """When the analytics window has enough rows the rich one-liner appears."""
+    now = datetime(2026, 4, 23, 12, 0, tzinfo=UTC)
+    # 6 wins + 2 losses inside the 90d window.
+    for i in range(6):
+        _seed_eval(
+            memory_db, symbol=f"W{i}USDT",
+            detected_at=now - timedelta(days=40 + i),
+            return_pct=10.0,
+        )
+    for i in range(2):
+        _seed_eval(
+            memory_db, symbol=f"L{i}USDT",
+            detected_at=now - timedelta(days=50 + i),
+            return_pct=-5.0,
+        )
+    summary = generate_weekly_summary(memory_db, now=now)
+    assert "📈 Análise (90d)" in summary.body
+    # Rich one-liner: WR / exp / PF / "8 sinais"
+    assert "WR 75.0%" in summary.body
+    assert "PF " in summary.body
+    assert "8 sinais" in summary.body
+
+
+def test_weekly_body_unchanged_for_existing_users_when_no_evaluations(memory_db):
+    """Empty DB → analytics shows the insufficient-data line; pre-existing
+    weekly content (zero counts, conclusion) is unchanged."""
+    now = datetime(2026, 4, 23, 12, 0, tzinfo=UTC)
+    summary = generate_weekly_summary(memory_db, now=now)
+    # Pre-existing structure still present.
+    assert "Sinais emitidos: 0" in summary.body
+    assert "Leitura rápida" in summary.body
+    # Analytics section appended with the documented insufficient-data line.
+    assert "📈 Análise (90d)" in summary.body
+    assert "dados insuficientes" in summary.body.lower()

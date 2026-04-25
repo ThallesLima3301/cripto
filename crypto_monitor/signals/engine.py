@@ -26,7 +26,10 @@ from __future__ import annotations
 from crypto_monitor.config.settings import ScoringSettings
 from crypto_monitor.indicators import (
     Candle,
+    atr,
+    detect_high_reclaim,
     detect_reversal,
+    detect_rsi_recovery,
     find_heuristic_support,
     relative_volume,
     rsi,
@@ -36,7 +39,7 @@ from crypto_monitor.signals.factors import (
     score_discount_from_high,
     score_drop_magnitude,
     score_relative_volume,
-    score_reversal_pattern,
+    score_reversal_confirmation,
     score_rsi_oversold,
     score_support_distance,
     score_trend_context,
@@ -54,11 +57,17 @@ def score_signal(
     *,
     detected_at: str | None = None,
     regime_at_signal: str | None = None,
+    min_score_adjust: int = 0,
 ) -> SignalCandidate | None:
     """Score a symbol and return a candidate, or None if no 1h data.
 
     Parameters added by v2 (backward-compatible defaults):
       *regime_at_signal* — stamped on the candidate for analytics.
+      *min_score_adjust* — added to ``min_signal_score`` when computing
+        severity. Lets the scheduler raise the bar in risk-off regimes
+        (positive value) or lower it in risk-on regimes (negative value)
+        without mutating shared config. Has no effect on the raw score
+        or on severity tier thresholds; only the emit gate moves.
     """
     if not candles_1h:
         return None
@@ -79,6 +88,7 @@ def score_signal(
     rsi_1h_val = rsi(closes_1h, period=14)
     rsi_4h_val = rsi(closes_4h, period=14)
     rel_vol_val = relative_volume(volumes_1h, period=20)
+    atr_1h_val = atr(candles_1h, period=14)
 
     support_info = find_heuristic_support(
         candles_1d,
@@ -87,6 +97,8 @@ def score_signal(
     )
 
     reversal = detect_reversal(candles_1h)
+    rsi_recovery = detect_rsi_recovery(closes_1h, period=14)
+    high_reclaim = detect_high_reclaim(candles_1h)
     trend_4h = trend_label(closes_4h)
     trend_1d = trend_label(closes_1d)
 
@@ -95,7 +107,9 @@ def score_signal(
     th = scoring.thresholds
 
     drop_pts, dom_tf, drop_trigger_pct, drop_detail = score_drop_magnitude(
-        drops, th, w.drop_magnitude
+        drops, th, w.drop_magnitude,
+        atr_1h=atr_1h_val,
+        price=price,
     )
     rsi_pts, rsi_detail = score_rsi_oversold(
         rsi_1h_val, rsi_4h_val, th, w.rsi_oversold
@@ -115,8 +129,12 @@ def score_signal(
         th,
         w.discount_from_high,
     )
-    rev_pts, rev_detail = score_reversal_pattern(
-        reversal.detected, reversal.pattern_name, w.reversal_pattern
+    rev_pts, rev_detail = score_reversal_confirmation(
+        reversal.detected,
+        reversal.pattern_name,
+        rsi_recovery,
+        high_reclaim,
+        w.reversal_pattern,
     )
     trend_pts, trend_detail = score_trend_context(
         trend_1d, w.trend_context
@@ -126,7 +144,7 @@ def score_signal(
         drop_pts + rsi_pts + vol_pts + sup_pts + disc_pts + rev_pts + trend_pts
     )
 
-    severity = _severity_for(total_score, scoring)
+    severity = _severity_for(total_score, scoring, min_score_adjust)
     trigger_reason = _trigger_reason(
         dom_tf, drop_trigger_pct, rsi_1h_val, rel_vol_val, reversal.pattern_name
     )
@@ -261,10 +279,18 @@ def _compute_highs_and_discounts(
 def _severity_for(
     score: int,
     scoring: ScoringSettings,
+    min_score_adjust: int = 0,
 ) -> str | None:
-    """Map a numeric score to a severity tier, or None if below threshold."""
+    """Map a numeric score to a severity tier, or None if below threshold.
+
+    The effective emit threshold is ``min_signal_score + min_score_adjust``
+    so the scheduler can shift the gate by regime without touching config
+    or the tier ladder. Tier boundaries (normal/strong/very_strong) are
+    intentionally left untouched — only the emit floor moves.
+    """
     s = scoring.severity
-    if score < scoring.thresholds.min_signal_score:
+    effective_floor = scoring.thresholds.min_signal_score + min_score_adjust
+    if score < effective_floor:
         return None
     if score >= s.very_strong:
         return "very_strong"

@@ -66,6 +66,11 @@ class SignalCandidate:
     # ---- v2 regime context (None when regime feature is disabled) ----
     regime_at_signal: str | None = None
 
+    # ---- v2 watchlist linkage (None unless this signal was promoted
+    # from an active watchlist entry — set by the scheduler in
+    # Block 23 when a borderline score crosses the emit threshold). ----
+    watchlist_id: int | None = None
+
     @property
     def should_emit(self) -> bool:
         """True when the candidate has a severity (score >= min_signal_score)."""

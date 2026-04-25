@@ -36,8 +36,10 @@ from crypto_monitor.config.settings import (
     IntervalsSettings,
     RegimeSettings,
     RetentionSettings,
+    SellSettings,
     Settings,
     SymbolsSettings,
+    WatchlistSettings,
 )
 from crypto_monitor.database.retention import prune_old_candles
 from crypto_monitor.notifications.ntfy import (
@@ -181,6 +183,19 @@ def _make_settings(
             atr_high_percentile=70.0,
             threshold_adjust_risk_on=-5,
             threshold_adjust_risk_off=5,
+        ),
+        sell=SellSettings(
+            enabled=False,
+            stop_loss_pct=8.0,
+            take_profit_pct=20.0,
+            trailing_stop_pct=10.0,
+            context_deterioration=True,
+            cooldown_hours=6,
+        ),
+        watchlist=WatchlistSettings(
+            enabled=False,
+            floor_score=35,
+            max_watch_hours=48,
         ),
     )
 

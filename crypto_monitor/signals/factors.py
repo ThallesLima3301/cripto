@@ -94,6 +94,9 @@ def score_drop_magnitude(
     drops: dict[str, float | None],
     th: ScoringThresholds,
     cap: int,
+    *,
+    atr_1h: float | None = None,
+    price: float | None = None,
 ) -> tuple[int, str | None, float | None, dict[str, Any]]:
     """Evaluate drop magnitude across all horizons; return the best.
 
@@ -105,30 +108,79 @@ def score_drop_magnitude(
     detail)`. When every horizon scored 0, dominant_horizon is None and
     drop_pct_of_dominant is None — the caller uses this to populate
     `dominant_trigger_timeframe` and `drop_trigger_pct`.
+
+    ATR-aware scoring (v2)
+    ----------------------
+    When both ``atr_1h`` and ``price`` are valid (positive numbers),
+    raw drop percentages are divided by ``atr_pct = atr_1h / price * 100``
+    before tier lookup. The same config thresholds are then interpreted
+    as "drop in ATR units", which amplifies drops in quiet markets and
+    dampens them in volatile ones.
+
+    When ATR data is missing, zero, or otherwise invalid, the helper
+    falls back to v1 raw-drop behavior exactly — no tier thresholds
+    change, no caller needs updating.
+
+    The `drop_pct_of_dominant` return value and the `detail["drop_pct"]`
+    field are always the RAW drop percentage — downstream callers
+    (alerts, weekly summaries, DB column `drop_trigger_pct`) keep
+    their existing meaning even when scoring is normalized.
     """
+    atr_normalized = (
+        atr_1h is not None
+        and atr_1h > 0
+        and price is not None
+        and price > 0
+    )
+    atr_pct: float | None = None
+    effective_drops: dict[str, float | None] = drops
+    if atr_normalized:
+        atr_pct = (atr_1h / price) * 100.0
+        if atr_pct > 0:
+            effective_drops = {
+                h: (d / atr_pct if d is not None else None)
+                for h, d in drops.items()
+            }
+        else:
+            # Defensive: atr_pct rounded to 0 for a vanishingly small
+            # ATR relative to price. Fall back to raw behavior.
+            atr_normalized = False
+            atr_pct = None
+
     horizon_points: dict[str, int] = {
-        "1h":   _tier_up(drops.get("1h"),   th.drop_1h,   th.drop_1h_points),
-        "24h":  _tier_up(drops.get("24h"),  th.drop_24h,  th.drop_24h_points),
-        "7d":   _tier_up(drops.get("7d"),   th.drop_7d,   th.drop_7d_points),
-        "30d":  _tier_up(drops.get("30d"),  th.drop_30d,  th.drop_30d_points),
-        "180d": _tier_up(drops.get("180d"), th.drop_180d, th.drop_180d_points),
+        "1h":   _tier_up(effective_drops.get("1h"),   th.drop_1h,   th.drop_1h_points),
+        "24h":  _tier_up(effective_drops.get("24h"),  th.drop_24h,  th.drop_24h_points),
+        "7d":   _tier_up(effective_drops.get("7d"),   th.drop_7d,   th.drop_7d_points),
+        "30d":  _tier_up(effective_drops.get("30d"),  th.drop_30d,  th.drop_30d_points),
+        "180d": _tier_up(effective_drops.get("180d"), th.drop_180d, th.drop_180d_points),
     }
     best_horizon, best_raw = max(horizon_points.items(), key=lambda kv: kv[1])
     capped = min(best_raw, cap)
 
     if best_raw == 0:
-        return 0, None, None, {"points": 0, "by_horizon": horizon_points}
+        detail: dict[str, Any] = {
+            "points": 0,
+            "by_horizon": horizon_points,
+            "atr_normalized": atr_normalized,
+        }
+        if atr_pct is not None:
+            detail["atr_pct"] = atr_pct
+        return 0, None, None, detail
 
+    detail = {
+        "points": capped,
+        "horizon": best_horizon,
+        "drop_pct": drops[best_horizon],
+        "by_horizon": horizon_points,
+        "atr_normalized": atr_normalized,
+    }
+    if atr_pct is not None:
+        detail["atr_pct"] = atr_pct
     return (
         capped,
         best_horizon,
         drops[best_horizon],
-        {
-            "points": capped,
-            "horizon": best_horizon,
-            "drop_pct": drops[best_horizon],
-            "by_horizon": horizon_points,
-        },
+        detail,
     )
 
 
@@ -201,13 +253,43 @@ def score_discount_from_high(
     }
 
 
-def score_reversal_pattern(
+def score_reversal_confirmation(
     detected: bool,
     pattern_name: str | None,
+    rsi_recovery: bool,
+    high_reclaim: bool,
     cap: int,
 ) -> tuple[int, dict[str, Any]]:
-    pts = cap if detected else 0
-    return pts, {"points": pts, "detected": detected, "pattern": pattern_name}
+    """Score candlestick pattern + RSI recovery + high reclaim (additive).
+
+    Sub-weights (Block 17, fixed):
+      * candlestick pattern detected   +5
+      * RSI recovered from oversold    +3
+      * latest close reclaims prior high +2
+
+    The sum is capped at ``cap`` (normally the factor budget from
+    ``ScoringWeights.reversal_pattern``, which is 10 by default and
+    equals the sum of the three sub-weights). The cap is kept as a
+    parameter so config changes cannot push this factor past the
+    reserved budget.
+
+    The detail dict always reports every sub-component so the breakdown
+    remains explicit and testable even when a component scored zero.
+    """
+    p_pattern = 5 if detected else 0
+    p_rsi = 3 if rsi_recovery else 0
+    p_high = 2 if high_reclaim else 0
+    total = min(p_pattern + p_rsi + p_high, cap)
+    return total, {
+        "points": total,
+        "points_pattern": p_pattern,
+        "points_rsi_recovery": p_rsi,
+        "points_high_reclaim": p_high,
+        "detected": detected,
+        "pattern": pattern_name,
+        "rsi_recovery": rsi_recovery,
+        "high_reclaim": high_reclaim,
+    }
 
 
 # Ladder for the 1d trend factor. Uptrend is rewarded (buying a dip in

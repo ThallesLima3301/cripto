@@ -291,9 +291,18 @@ def format_weekly_body(
     buy_count: int,
     matured_count: int,
     verdict_counts: Mapping[str, int],
+    analytics_summary: str | None = None,
+    analytics_scope_label: str | None = None,
     debug: bool = False,
 ) -> str:
-    """Render the weekly summary body in Portuguese."""
+    """Render the weekly summary body in Portuguese.
+
+    ``analytics_summary`` (Block 26) is the optional one-line analytics
+    digest produced by ``format_expectancy_summary``. When provided,
+    a small "Análise" section is appended after the conclusion line.
+    The ``analytics_scope_label`` (e.g. ``"90d"``) is rendered next to
+    the section header so the reader knows the window.
+    """
     lines: list[str] = []
     lines.append("📊 Resumo da semana")
     lines.append("")
@@ -336,6 +345,15 @@ def format_weekly_body(
     # Conclusion line — always present.
     lines.append("")
     lines.append(_weekly_conclusion(signal_count, signal_by_severity))
+
+    # Optional analytics section (Block 26). Rendered after the
+    # conclusion so the existing UX is preserved when analytics are
+    # disabled or unavailable.
+    if analytics_summary:
+        scope_part = f" ({analytics_scope_label})" if analytics_scope_label else ""
+        lines.append("")
+        lines.append(f"📈 Análise{scope_part}")
+        lines.append(analytics_summary)
 
     if debug:
         lines.append("")
@@ -383,3 +401,107 @@ def _weekly_conclusion(
     if strong > 0:
         return "Leitura rápida: sinais moderados — vale acompanhar."
     return "Leitura rápida: apenas sinais fracos, sem urgência."
+
+
+# ---------- sell alert formatting (Block 21) ----------
+
+# Portuguese headline per rule. Kept separate from buy-side decisions
+# so the two notification paths cannot accidentally drift.
+_SELL_RULE_PHRASES: dict[str, str] = {
+    "stop_loss":             "🔴 Stop-loss acionado",
+    "trailing_stop":         "🟠 Trailing stop acionado",
+    "take_profit":           "🟢 Take-profit atingido",
+    "context_deterioration": "🟡 Contexto deteriorando",
+}
+
+_SELL_RULE_DEFAULT = "⚠️ Sinal de venda"
+
+# Map sell severity -> ntfy priority. Kept here so the notification
+# layer owns the translation (mirroring the buy-side mapping that
+# lives in notifications/service.py).
+SELL_PRIORITY_BY_SEVERITY: dict[str, str] = {
+    "high": "max",
+    "medium": "high",
+}
+SELL_PRIORITY_DEFAULT = "default"
+
+
+def format_sell_alert_title(
+    symbol: str,
+    rule_triggered: str,
+    *,
+    debug: bool = False,
+) -> str:
+    """Render the sell-notification title.
+
+    Format: ``<rule phrase> — <friendly symbol>``. In debug mode the
+    raw pair and rule tag are appended so operators can grep.
+    """
+    phrase = _SELL_RULE_PHRASES.get(rule_triggered, _SELL_RULE_DEFAULT)
+    name = friendly_name(symbol)
+    title = f"{phrase} — {name}"
+    if debug:
+        title += f" ({symbol} / {rule_triggered})"
+    return title
+
+
+def format_sell_alert_body(
+    signal: Mapping[str, Any],
+    *,
+    debug: bool = False,
+) -> str:
+    """Render the sell-notification body.
+
+    ``signal`` must expose the ``sell_signals`` columns. Client mode
+    produces: price line, pnl line, one-line reason, optional regime
+    tag, and a short interpretation. Debug mode appends the raw
+    field dump.
+    """
+    symbol = signal["symbol"]
+    rule = signal["rule_triggered"]
+    price = signal["price_at_signal"]
+    pnl = signal.get("pnl_pct")
+
+    lines: list[str] = []
+    lines.append(f"{friendly_name(symbol)} @ ${price:g}")
+
+    if pnl is not None:
+        if pnl >= 0:
+            lines.append(f"Resultado: +{pnl:.2f}%")
+        else:
+            lines.append(f"Resultado: {pnl:.2f}%")
+
+    reason = signal.get("reason")
+    if reason:
+        lines.append(f"• {reason}")
+
+    regime = _regime_line(signal.get("regime_at_signal"))
+    if regime:
+        lines.append(regime)
+
+    lines.append("")
+    lines.append(_sell_conclusion(rule, pnl))
+
+    body = "\n".join(lines)
+
+    if debug:
+        body += "\n\n--- debug ---\n"
+        body += f"pair={symbol} rule={rule} severity={signal.get('severity')}\n"
+        body += f"buy_id={signal.get('buy_id')} price={price} pnl={pnl}\n"
+        body += f"regime={signal.get('regime_at_signal')}\n"
+        body += f"detected_at={signal.get('detected_at')}"
+
+    return body
+
+
+def _sell_conclusion(rule: str, pnl: float | None) -> str:
+    """One-line interpretation line specific to each sell rule."""
+    if rule == "stop_loss":
+        return "Decisão sugerida: proteger capital — considere sair."
+    if rule == "trailing_stop":
+        return "Decisão sugerida: travar lucro após recuo do topo."
+    if rule == "take_profit":
+        return "Decisão sugerida: realizar lucro parcial ou total."
+    if rule == "context_deterioration":
+        return "Decisão sugerida: reavaliar — contexto adverso."
+    return "Decisão sugerida: reavaliar a posição."

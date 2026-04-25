@@ -237,3 +237,164 @@ def _migrate_002_regime(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE signals ADD COLUMN regime_at_signal TEXT"
         )
+
+
+@register_migration(3)
+def _migrate_003_sell(conn: sqlite3.Connection) -> None:
+    """Sell-engine data model (Block 19, schema only).
+
+    Adds the two persistence tables the sell engine will use plus three
+    nullable columns on ``buys`` so a position can be marked sold
+    without breaking any existing reader. No business logic is wired
+    yet — this migration is purely about shape.
+
+      * ``sell_tracking``  — one high-water-mark row per (symbol, buy_id)
+        used by the trailing-stop rule. PRIMARY KEY (symbol, buy_id)
+        keeps it idempotent and lets ``upsert`` use ON CONFLICT.
+      * ``sell_signals``   — append-only log of sell-side decisions.
+        ``buy_id`` is a FK so a sell signal is always anchored to the
+        position it refers to. ``rule_triggered`` is a free TEXT so
+        future rules can be added without a schema change.
+      * ``buys.sold_at`` / ``sold_price`` / ``sold_note`` — nullable so
+        every existing buy row remains valid (open position).
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sell_tracking (
+            symbol            TEXT NOT NULL,
+            buy_id            INTEGER NOT NULL REFERENCES buys(id),
+            high_watermark    REAL NOT NULL,
+            updated_at        TEXT NOT NULL,
+            PRIMARY KEY (symbol, buy_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sell_signals (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol             TEXT NOT NULL,
+            buy_id             INTEGER NOT NULL REFERENCES buys(id),
+            detected_at        TEXT NOT NULL,
+            price_at_signal    REAL NOT NULL,
+            rule_triggered     TEXT NOT NULL,
+            severity           TEXT NOT NULL,
+            reason             TEXT NOT NULL,
+            pnl_pct            REAL,
+            regime_at_signal   TEXT,
+            alerted            INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sell_signals_symbol_time
+        ON sell_signals (symbol, detected_at DESC)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sell_signals_buy
+        ON sell_signals (buy_id, detected_at DESC)
+    """)
+    if not column_exists(conn, "buys", "sold_at"):
+        conn.execute("ALTER TABLE buys ADD COLUMN sold_at TEXT")
+    if not column_exists(conn, "buys", "sold_price"):
+        conn.execute("ALTER TABLE buys ADD COLUMN sold_price REAL")
+    if not column_exists(conn, "buys", "sold_note"):
+        conn.execute("ALTER TABLE buys ADD COLUMN sold_note TEXT")
+
+
+@register_migration(4)
+def _migrate_004_watchlist(conn: sqlite3.Connection) -> None:
+    """Watchlist data model (Block 22, schema only).
+
+    The watchlist tracks "borderline" setups — scores sitting between
+    ``watchlist.floor_score`` and ``scoring.thresholds.min_signal_score``
+    — so they can be promoted to a real buy signal if the score climbs
+    past the emit floor, or be quietly aged out if it drifts. Block 22
+    only ships the persistence shape:
+
+      * ``watchlist``                      — append-only log with exactly
+        one ``status='watching'`` row per symbol, enforced by a partial
+        unique index. Resolved rows (promoted / expired) remain so the
+        history is inspectable.
+      * ``signals.watchlist_id``           — nullable FK so a signal
+        emitted from a promoted watch can be traced back to the
+        originating watch row. Every existing row stays valid because
+        the column is nullable.
+
+    Idempotent via ``CREATE ... IF NOT EXISTS`` and ``column_exists``
+    guards.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol                TEXT NOT NULL,
+            status                TEXT NOT NULL,
+            first_seen_at         TEXT NOT NULL,
+            last_seen_at          TEXT NOT NULL,
+            last_score            INTEGER NOT NULL,
+            expires_at            TEXT NOT NULL,
+            promoted_signal_id    INTEGER REFERENCES signals(id),
+            resolved_at           TEXT,
+            resolution_reason     TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_active_symbol
+        ON watchlist (symbol)
+        WHERE status = 'watching'
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_watchlist_status_expires
+        ON watchlist (status, expires_at)
+    """)
+    if not column_exists(conn, "signals", "watchlist_id"):
+        conn.execute(
+            "ALTER TABLE signals ADD COLUMN watchlist_id INTEGER "
+            "REFERENCES watchlist(id)"
+        )
+
+
+@register_migration(5)
+def _migrate_005_eval_timing(conn: sqlite3.Connection) -> None:
+    """MFE/MAE timing extensions for evaluation rows (Block 24).
+
+    Adds nullable timing/peak columns to the evaluation tables:
+
+      * ``signal_evaluations.time_to_mfe_hours``  — hours from
+        ``candle_hour`` to the bar that produced the maximum favorable
+        excursion (MFE) inside the 7-day window.
+      * ``signal_evaluations.time_to_mae_hours``  — same for MAE.
+      * ``buy_evaluations.max_gain_pct``          — MFE % over the 7-day
+        post-buy window. Mirrors signal_evaluations.max_gain_7d_pct
+        but the column is named without the horizon so a future
+        config-driven window can reuse it.
+      * ``buy_evaluations.max_loss_pct``          — MAE % counterpart.
+      * ``buy_evaluations.time_to_mfe_hours``     — hours from buy
+        time to the MFE bar.
+      * ``buy_evaluations.time_to_mae_hours``     — hours from buy
+        time to the MAE bar.
+
+    Every column is nullable; pre-existing rows keep their semantics and
+    receive NULL for the new fields. Idempotent via ``column_exists``
+    guards on each ``ALTER TABLE``.
+    """
+    if not column_exists(conn, "signal_evaluations", "time_to_mfe_hours"):
+        conn.execute(
+            "ALTER TABLE signal_evaluations ADD COLUMN time_to_mfe_hours REAL"
+        )
+    if not column_exists(conn, "signal_evaluations", "time_to_mae_hours"):
+        conn.execute(
+            "ALTER TABLE signal_evaluations ADD COLUMN time_to_mae_hours REAL"
+        )
+    if not column_exists(conn, "buy_evaluations", "max_gain_pct"):
+        conn.execute(
+            "ALTER TABLE buy_evaluations ADD COLUMN max_gain_pct REAL"
+        )
+    if not column_exists(conn, "buy_evaluations", "max_loss_pct"):
+        conn.execute(
+            "ALTER TABLE buy_evaluations ADD COLUMN max_loss_pct REAL"
+        )
+    if not column_exists(conn, "buy_evaluations", "time_to_mfe_hours"):
+        conn.execute(
+            "ALTER TABLE buy_evaluations ADD COLUMN time_to_mfe_hours REAL"
+        )
+    if not column_exists(conn, "buy_evaluations", "time_to_mae_hours"):
+        conn.execute(
+            "ALTER TABLE buy_evaluations ADD COLUMN time_to_mae_hours REAL"
+        )

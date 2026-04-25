@@ -3,6 +3,12 @@
 These tests drive the engine with synthetic closed-candle series chosen
 so the score lands deterministically in a specific severity tier.
 
+Block 18 also adds tests for `min_score_adjust` — the keyword the
+scheduler uses to shift the emit floor by regime (negative in risk_on,
+positive in risk_off, 0 in neutral or when the regime feature is
+disabled). The shift only moves the emit gate; tier boundaries are
+intentionally untouched.
+
 The canonical "crash" series built by `_build_crash_series` produces
 exactly 70 points with config.example weights:
 
@@ -16,12 +22,19 @@ exactly 70 points with config.example weights:
     ---
     total             70  -> severity = "strong"
 
-Adding a hammer on the very last 1h candle adds the reversal_pattern
-factor's 10 points and bumps the total to 80 -> "very_strong".
+Adding a hammer on the very last 1h candle contributes 5 points from
+the pattern sub-component of the reversal_confirmation factor (Block 17:
+pattern=5, rsi_recovery=3, high_reclaim=2, cap=10). The monotonic
+downtrend means neither RSI recovery nor high reclaim fire, so the
+total reaches 75 — still "strong", not "very_strong". A pure-crash
+series cannot light all three confirmation sub-components by design.
 """
 
 from __future__ import annotations
 
+import dataclasses
+
+from crypto_monitor.config.settings import ScoringSeverity, ScoringSettings, ScoringThresholds
 from crypto_monitor.indicators import Candle
 from crypto_monitor.signals import score_signal
 
@@ -146,19 +159,31 @@ def test_strong_scenario(scoring_settings):
     assert candidate.recent_180d_high is not None
 
 
-def test_very_strong_scenario(scoring_settings):
+def test_crash_with_hammer_lifts_score_via_pattern_subcomponent(scoring_settings):
+    """A crash + hammer fires the pattern sub-component (5 pts).
+
+    Block 17 split the 10-point reversal factor into pattern (5) +
+    rsi_recovery (3) + high_reclaim (2). A monotonic crash cannot
+    trigger the latter two — RSI is pinned at zero and price never
+    reclaims a prior high — so the hammer bumps the total by 5 only.
+    The candidate stays in the 'strong' tier (≥ 65), but the engine's
+    reversal-pattern reporting still surfaces the hammer.
+    """
     candles_1h, candles_4h, candles_1d = _build_crash_series()
 
     # Overwrite the last 1h candle with a hammer while preserving the
-    # elevated volume. Body=1, lower_wick=2.5, upper_wick=0 — a textbook
-    # hammer. Close stays at 40 so the RSI tail still reads as monotonic
-    # down (the last delta remains -0.5).
+    # elevated volume. Body=0.5, lower_wick=1.0, upper_wick=0 — satisfies
+    # is_hammer (lower_wick >= 2*body, upper_wick <= 0.25*range). Close
+    # stays at 40 so the RSI tail still reads as monotonic down (the
+    # last delta remains -0.5). The range is kept close to the baseline
+    # per-candle move so ATR-normalized drop scoring (Block 16) does
+    # not materially dampen the 7d drop tier.
     last = candles_1h[-1]
     candles_1h[-1] = Candle(
         open_time=last.open_time,
-        open=41.0,
-        high=41.0,
-        low=37.5,
+        open=40.5,
+        high=40.5,
+        low=39.0,
         close=40.0,
         volume=last.volume,
         close_time=last.close_time,
@@ -172,11 +197,17 @@ def test_very_strong_scenario(scoring_settings):
     )
 
     assert candidate is not None
-    assert candidate.severity == "very_strong"
-    assert candidate.score >= 80
+    assert candidate.severity == "strong"
+    assert 70 <= candidate.score < 80
     assert candidate.reversal_signal is True
     assert candidate.reversal_pattern == "hammer"
     assert "hammer" in candidate.trigger_reason
+
+    # The new sub-component breakdown is recorded in the score breakdown.
+    rev = candidate.score_breakdown["reversal_pattern"]
+    assert rev["points_pattern"] == 5
+    assert rev["points_rsi_recovery"] == 0
+    assert rev["points_high_reclaim"] == 0
 
 
 # ---------- no-signal scenario ----------
@@ -249,3 +280,147 @@ def test_insufficient_history_is_not_an_error(scoring_settings):
     assert candidate.score < scoring_settings.thresholds.min_signal_score
     assert candidate.severity is None
     assert candidate.should_emit is False
+
+
+# ---------- Block 18: regime-driven min_score_adjust ----------
+
+def _scoring_with_floor(scoring: ScoringSettings, floor: int) -> ScoringSettings:
+    """Return a copy of `scoring` with `min_signal_score = floor`.
+
+    Used by the Block 18 tests so the natural crash score (70) sits
+    just above or below the configured floor and the effect of
+    `min_score_adjust` is easy to read.
+    """
+    new_th = dataclasses.replace(scoring.thresholds, min_signal_score=floor)
+    return dataclasses.replace(scoring, thresholds=new_th)
+
+
+def _scoring_with_severity_split(scoring: ScoringSettings, *, floor: int, normal: int) -> ScoringSettings:
+    """Return a copy with a custom emit floor AND a lower severity.normal.
+
+    The default conftest fixture sets ``min_signal_score == severity.normal``,
+    so a *negative* `min_score_adjust` cannot promote a candidate without
+    also relaxing the severity ladder. This helper drops `severity.normal`
+    below `floor` so the risk_on case is observable end-to-end.
+    """
+    new_th = dataclasses.replace(scoring.thresholds, min_signal_score=floor)
+    new_sev = dataclasses.replace(scoring.severity, normal=normal)
+    return dataclasses.replace(scoring, thresholds=new_th, severity=new_sev)
+
+
+def test_min_score_adjust_default_is_noop(scoring_settings):
+    """Omitting `min_score_adjust` reproduces v1 emit-floor behavior."""
+    candles_1h, candles_4h, candles_1d = _build_crash_series()
+    candidate = score_signal(
+        "BTCUSDT",
+        candles_1h, candles_4h, candles_1d,
+        scoring_settings,
+        detected_at="2026-04-11T15:00:00Z",
+    )
+    assert candidate is not None
+    assert candidate.severity == "strong"
+    assert candidate.should_emit is True
+
+
+def test_risk_off_adjust_raises_floor_and_blocks_borderline_signal(scoring_settings):
+    """A positive adjust raises the emit floor; a 70-pt signal can be suppressed."""
+    candles_1h, candles_4h, candles_1d = _build_crash_series()
+
+    # Floor 65 + adjust +10 -> effective floor 75 > score 70 -> blocked.
+    cfg = _scoring_with_floor(scoring_settings, floor=65)
+    candidate = score_signal(
+        "BTCUSDT",
+        candles_1h, candles_4h, candles_1d,
+        cfg,
+        detected_at="2026-04-11T15:00:00Z",
+        min_score_adjust=10,
+    )
+    assert candidate is not None
+    assert candidate.score == 70
+    assert candidate.severity is None
+    assert candidate.should_emit is False
+
+
+def test_risk_off_adjust_below_score_still_emits(scoring_settings):
+    """If the raised floor is still below the score, severity is unchanged."""
+    candles_1h, candles_4h, candles_1d = _build_crash_series()
+
+    # Floor 50 + adjust +5 -> effective floor 55 < score 70 -> still emits,
+    # tier ladder untouched -> severity stays "strong".
+    candidate = score_signal(
+        "BTCUSDT",
+        candles_1h, candles_4h, candles_1d,
+        scoring_settings,
+        detected_at="2026-04-11T15:00:00Z",
+        min_score_adjust=5,
+    )
+    assert candidate is not None
+    assert candidate.score == 70
+    assert candidate.severity == "strong"
+    assert candidate.should_emit is True
+
+
+def test_neutral_adjust_zero_matches_baseline(scoring_settings):
+    """`min_score_adjust=0` produces the exact same outcome as omitting it."""
+    candles_1h, candles_4h, candles_1d = _build_crash_series()
+    baseline = score_signal(
+        "BTCUSDT", candles_1h, candles_4h, candles_1d, scoring_settings,
+        detected_at="2026-04-11T15:00:00Z",
+    )
+    explicit = score_signal(
+        "BTCUSDT", candles_1h, candles_4h, candles_1d, scoring_settings,
+        detected_at="2026-04-11T15:00:00Z",
+        min_score_adjust=0,
+    )
+    assert baseline is not None and explicit is not None
+    assert baseline.score == explicit.score
+    assert baseline.severity == explicit.severity
+    assert baseline.should_emit == explicit.should_emit
+
+
+def test_risk_on_adjust_lowers_floor_and_promotes_borderline_signal(scoring_settings):
+    """A negative adjust drops the emit floor; a sub-floor score can promote."""
+    candles_1h, candles_4h, candles_1d = _build_crash_series()
+
+    # Custom config: floor=80 (so 70-pt crash is normally blocked) but
+    # severity.normal=50 (so 70 still maps to a tier when emitted).
+    cfg = _scoring_with_severity_split(scoring_settings, floor=80, normal=50)
+
+    blocked = score_signal(
+        "BTCUSDT", candles_1h, candles_4h, candles_1d, cfg,
+        detected_at="2026-04-11T15:00:00Z",
+    )
+    assert blocked is not None
+    assert blocked.score == 70
+    assert blocked.severity is None
+    assert blocked.should_emit is False
+
+    promoted = score_signal(
+        "BTCUSDT", candles_1h, candles_4h, candles_1d, cfg,
+        detected_at="2026-04-11T15:00:00Z",
+        min_score_adjust=-15,  # effective floor 65 < 70 -> emits
+    )
+    assert promoted is not None
+    assert promoted.score == 70
+    assert promoted.severity == "strong"  # tier ladder unchanged
+    assert promoted.should_emit is True
+
+
+def test_min_score_adjust_does_not_change_score_or_breakdown(scoring_settings):
+    """The adjust shifts the emit gate only — never the raw score or details."""
+    candles_1h, candles_4h, candles_1d = _build_crash_series()
+    a = score_signal(
+        "BTCUSDT", candles_1h, candles_4h, candles_1d, scoring_settings,
+        detected_at="2026-04-11T15:00:00Z",
+        min_score_adjust=0,
+    )
+    b = score_signal(
+        "BTCUSDT", candles_1h, candles_4h, candles_1d, scoring_settings,
+        detected_at="2026-04-11T15:00:00Z",
+        min_score_adjust=10,
+    )
+    assert a is not None and b is not None
+    assert a.score == b.score
+    assert a.score_breakdown == b.score_breakdown
+    assert a.trigger_reason == b.trigger_reason
+    assert a.dominant_trigger_timeframe == b.dominant_trigger_timeframe

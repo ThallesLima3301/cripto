@@ -34,6 +34,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import IO, Sequence
 
+from crypto_monitor.analytics import (
+    compute_expectancy,
+    format_expectancy_report,
+    load_evaluation_rows,
+)
 from crypto_monitor.buys import insert_buy, list_buys
 from crypto_monitor.config.settings import (
     CONFIG_EXAMPLE_FILENAME,
@@ -42,10 +47,13 @@ from crypto_monitor.config.settings import (
     load_settings,
 )
 from crypto_monitor.database.connection import get_connection
+from crypto_monitor.database.migrations import run_migrations
 from crypto_monitor.database.schema import init_db, seed_default_symbols
 from crypto_monitor.notifications.ntfy import send_ntfy
 from crypto_monitor.scheduler import run_maintenance, run_scan, run_weekly
+from crypto_monitor.sell import record_sale
 from crypto_monitor.utils.time_utils import from_utc_iso, now_utc
+from crypto_monitor.watchlist import list_watching
 
 
 logger = logging.getLogger(__name__)
@@ -170,6 +178,84 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="Maximum rows to display (default: 50).",
+    )
+
+    # sell ----------------------------------------------------------------
+    sell_p = sub.add_parser("sell", help="Record manual sales and list sell signals.")
+    sell_sub = sell_p.add_subparsers(dest="sell_command", required=True)
+
+    sell_record = sell_sub.add_parser(
+        "record",
+        help="Mark an open buy as sold (updates the buys row).",
+    )
+    sell_record.add_argument(
+        "--buy-id", type=int, required=True, help="Target buys.id."
+    )
+    sell_record.add_argument(
+        "--price", type=float, required=True, help="Realized sell price."
+    )
+    sell_record.add_argument(
+        "--at",
+        dest="sold_at",
+        help="ISO-8601 UTC timestamp of the sale. Defaults to now.",
+    )
+    sell_record.add_argument("--note", help="Free-form note.")
+
+    sell_list = sell_sub.add_parser(
+        "list",
+        help="List recent sell signals from the sell_signals table.",
+    )
+    sell_list.add_argument("--symbol", help="Filter by symbol.")
+    sell_list.add_argument(
+        "--rule",
+        choices=(
+            "stop_loss", "trailing_stop", "take_profit", "context_deterioration",
+        ),
+        help="Filter by triggered rule.",
+    )
+    sell_list.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum rows to display (default: 50).",
+    )
+
+    # analytics -----------------------------------------------------------
+    analytics_p = sub.add_parser(
+        "analytics",
+        help="Compute expectancy / win-rate analytics over evaluated signals.",
+    )
+    analytics_sub = analytics_p.add_subparsers(
+        dest="analytics_command", required=True,
+    )
+    analytics_summary = analytics_sub.add_parser(
+        "summary",
+        help="Print the expectancy report for a recent window.",
+    )
+    analytics_summary.add_argument(
+        "--scope",
+        choices=("all", "90d", "30d"),
+        default="all",
+        help="Time window for the analytics input (default: all).",
+    )
+    analytics_summary.add_argument(
+        "--min-signals",
+        type=int,
+        default=5,
+        help="Minimum rows for a sliced bucket to appear (default: 5).",
+    )
+
+    # watchlist -----------------------------------------------------------
+    watchlist_p = sub.add_parser(
+        "watchlist",
+        help="Inspect borderline-score watchlist entries.",
+    )
+    watchlist_sub = watchlist_p.add_subparsers(
+        dest="watchlist_command", required=True,
+    )
+    watchlist_sub.add_parser(
+        "list",
+        help="List active watchlist entries (status='watching').",
     )
 
     # ntfy-test -----------------------------------------------------------
@@ -437,6 +523,173 @@ def _select_signals(
     return conn.execute(sql, tuple(params)).fetchall()
 
 
+# ---------- sell ----------
+
+def _cmd_sell(args: argparse.Namespace, ctx: _Context) -> int:
+    if args.sell_command == "record":
+        return _cmd_sell_record(args, ctx)
+    if args.sell_command == "list":
+        return _cmd_sell_list(args, ctx)
+    ctx.err(f"error: unknown sell subcommand: {args.sell_command}")
+    return 2
+
+
+def _cmd_sell_record(args: argparse.Namespace, ctx: _Context) -> int:
+    settings = load_settings(ctx.project_root)
+    sold_at = _parse_timestamp(args.sold_at) if args.sold_at else now_utc()
+
+    conn = get_connection(settings.general.db_path)
+    try:
+        init_db(conn)
+        run_migrations(conn)  # ensure the sold_* columns exist
+        record_sale(
+            conn,
+            buy_id=args.buy_id,
+            sold_at=sold_at,
+            sold_price=args.price,
+            sold_note=args.note,
+        )
+    finally:
+        conn.close()
+
+    ctx.out(
+        f"recorded sale buy_id={args.buy_id} "
+        f"price={args.price:g} at {sold_at.isoformat()}"
+    )
+    return 0
+
+
+def _cmd_sell_list(args: argparse.Namespace, ctx: _Context) -> int:
+    settings = load_settings(ctx.project_root)
+    conn = get_connection(settings.general.db_path)
+    try:
+        init_db(conn)
+        run_migrations(conn)
+        rows = _select_sell_signals(
+            conn,
+            symbol=args.symbol,
+            rule=args.rule,
+            limit=max(1, args.limit),
+        )
+    finally:
+        conn.close()
+
+    if not rows:
+        ctx.out("(no sell signals recorded)")
+        return 0
+
+    header = (
+        f"{'id':>5}  {'detected_at':<20}  {'symbol':<10}  "
+        f"{'buy':>4}  {'rule':<22}  {'sev':<6}  "
+        f"{'price':>10}  {'pnl%':>7}  reason"
+    )
+    ctx.out(header)
+    ctx.out("-" * len(header))
+    for row in rows:
+        pnl = row["pnl_pct"]
+        pnl_txt = f"{pnl:+.2f}" if pnl is not None else "-"
+        ctx.out(
+            f"{row['id']:>5}  {row['detected_at']:<20}  "
+            f"{row['symbol']:<10}  "
+            f"{row['buy_id']:>4}  "
+            f"{row['rule_triggered']:<22}  "
+            f"{row['severity']:<6}  "
+            f"{row['price_at_signal']:>10.4f}  "
+            f"{pnl_txt:>7}  "
+            f"{row['reason']}"
+        )
+    return 0
+
+
+def _select_sell_signals(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str | None,
+    rule: str | None,
+    limit: int,
+) -> list[sqlite3.Row]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if symbol is not None:
+        clauses.append("symbol = ?")
+        params.append(symbol)
+    if rule is not None:
+        clauses.append("rule_triggered = ?")
+        params.append(rule)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    sql = f"""
+        SELECT id, detected_at, symbol, buy_id, rule_triggered,
+               severity, price_at_signal, pnl_pct, reason
+        FROM sell_signals
+        {where}
+        ORDER BY detected_at DESC, id DESC
+        LIMIT ?
+    """
+    return conn.execute(sql, tuple(params)).fetchall()
+
+
+# ---------- analytics ----------
+
+def _cmd_analytics(args: argparse.Namespace, ctx: _Context) -> int:
+    if args.analytics_command == "summary":
+        return _cmd_analytics_summary(args, ctx)
+    ctx.err(f"error: unknown analytics subcommand: {args.analytics_command}")
+    return 2
+
+
+def _cmd_analytics_summary(args: argparse.Namespace, ctx: _Context) -> int:
+    settings = load_settings(ctx.project_root)
+    conn = get_connection(settings.general.db_path)
+    try:
+        init_db(conn)
+        run_migrations(conn)
+        rows = load_evaluation_rows(conn, scope=args.scope)
+    finally:
+        conn.close()
+
+    report = compute_expectancy(rows, min_signals=max(1, args.min_signals))
+    ctx.out(format_expectancy_report(report))
+    return 0
+
+
+# ---------- watchlist ----------
+
+def _cmd_watchlist(args: argparse.Namespace, ctx: _Context) -> int:
+    if args.watchlist_command == "list":
+        return _cmd_watchlist_list(args, ctx)
+    ctx.err(f"error: unknown watchlist subcommand: {args.watchlist_command}")
+    return 2
+
+
+def _cmd_watchlist_list(args: argparse.Namespace, ctx: _Context) -> int:
+    settings = load_settings(ctx.project_root)
+    conn = get_connection(settings.general.db_path)
+    try:
+        init_db(conn)
+        run_migrations(conn)
+        entries = list_watching(conn)
+    finally:
+        conn.close()
+
+    if not entries:
+        ctx.out("(no active watchlist entries)")
+        return 0
+
+    header = (
+        f"{'id':>4}  {'symbol':<10}  {'first_seen':<20}  "
+        f"{'last_seen':<20}  {'score':>5}  {'expires_at':<20}"
+    )
+    ctx.out(header)
+    ctx.out("-" * len(header))
+    for e in entries:
+        ctx.out(
+            f"{e.id:>4}  {e.symbol:<10}  {e.first_seen_at:<20}  "
+            f"{e.last_seen_at:<20}  {e.last_score:>5}  {e.expires_at:<20}"
+        )
+    return 0
+
+
 # ---------- ntfy-test ----------
 
 def _cmd_ntfy_test(args: argparse.Namespace, ctx: _Context) -> int:
@@ -484,6 +737,9 @@ _HANDLERS = {
     "weekly": _cmd_weekly,
     "evaluate": _cmd_evaluate,
     "buy": _cmd_buy,
+    "sell": _cmd_sell,
     "signals": _cmd_signals,
+    "watchlist": _cmd_watchlist,
+    "analytics": _cmd_analytics,
     "ntfy-test": _cmd_ntfy_test,
 }

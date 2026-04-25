@@ -52,6 +52,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Mapping
 
+from crypto_monitor.analytics import (
+    compute_expectancy,
+    format_expectancy_summary,
+    load_evaluation_rows,
+)
 from crypto_monitor.config.settings import NtfySettings
 from crypto_monitor.notifications.formatters import (
     format_weekly_body,
@@ -65,6 +70,18 @@ logger = logging.getLogger(__name__)
 
 
 WINDOW_DAYS = 7
+
+# Analytics window for the weekly body. The 7-day window is too narrow
+# for matured (>= 30d) signals, so the analytics section samples a
+# rolling 90 days — matches the default ``analytics summary`` CLI scope
+# users will see on demand.
+ANALYTICS_SCOPE_LABEL = "90d"
+ANALYTICS_SCOPE_NAME = "90d"
+# Minimum total_signals required before the analytics section renders
+# the rich one-liner. Below this we still append the section header,
+# but the formatter writes "dados insuficientes" so the user sees the
+# feature exists.
+MIN_ANALYTICS_FOR_WEEKLY = 5
 
 
 NtfySender = Callable[..., SendResult]
@@ -139,6 +156,8 @@ def generate_weekly_summary(
     )
     matured_count = sum(verdict_counts.values())
 
+    analytics_summary, analytics_label = _build_analytics_section(conn, now)
+
     body = format_weekly_body(
         week_start_iso=week_start_iso,
         week_end_iso=week_end_iso,
@@ -149,6 +168,8 @@ def generate_weekly_summary(
         buy_count=buy_count,
         matured_count=matured_count,
         verdict_counts=verdict_counts,
+        analytics_summary=analytics_summary,
+        analytics_scope_label=analytics_label,
         debug=debug,
     )
 
@@ -337,6 +358,39 @@ def _count_buys(
         (start_iso, end_iso),
     ).fetchone()
     return int(row["cnt"]) if row is not None else 0
+
+
+def _build_analytics_section(
+    conn: sqlite3.Connection,
+    now: datetime,
+) -> tuple[str | None, str | None]:
+    """Compute the analytics digest line for the weekly body.
+
+    Returns ``(summary_line, scope_label)``. When fewer than
+    ``MIN_ANALYTICS_FOR_WEEKLY`` matured rows are available we still
+    return a non-empty summary line so the reader sees that the
+    feature exists, but with the ``"dados insuficientes"`` wording —
+    matching the CLI's behavior on the same input.
+
+    Errors during the analytics pass are swallowed (and logged): a
+    weekly summary should never fail because the analytics layer
+    couldn't run.
+    """
+    try:
+        rows = load_evaluation_rows(
+            conn, scope=ANALYTICS_SCOPE_NAME, now=now,
+        )
+    except Exception:
+        logger.exception("weekly analytics: failed to load rows")
+        return (None, None)
+    report = compute_expectancy(rows, min_signals=MIN_ANALYTICS_FOR_WEEKLY)
+    if report.total_signals < MIN_ANALYTICS_FOR_WEEKLY:
+        # Below the weekly's threshold — surface the section header so
+        # the reader knows the feature exists, but write the
+        # "insufficient data" line instead of half-confident metrics.
+        return ("Análise: dados insuficientes", ANALYTICS_SCOPE_LABEL)
+    line = format_expectancy_summary(report)
+    return (line, ANALYTICS_SCOPE_LABEL)
 
 
 def _count_verdicts_matured_in_window(

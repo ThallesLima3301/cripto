@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from crypto_monitor.indicators import Candle
 from crypto_monitor.indicators.patterns import (
+    detect_high_reclaim,
     detect_reversal,
+    detect_rsi_recovery,
     is_bullish_engulfing,
     is_doji,
     is_hammer,
@@ -136,3 +138,83 @@ def test_detect_reversal_empty_list_returns_no_pattern():
     result = detect_reversal([])
     assert result.detected is False
     assert result.pattern_name is None
+
+
+# ---------- detect_rsi_recovery ----------
+
+def _crash_then_recover_closes() -> list[float]:
+    """Build a closes series whose RSI dips into oversold then recovers.
+
+    20 flat candles at 100 (RSI seed = 50ish), then a sharp 8-bar
+    descent that pushes RSI well below 30, then a strong rebound that
+    lifts the latest RSI back above 30.
+    """
+    closes = [100.0] * 20
+    # Sharp descent — eight steps down by 5 each.
+    closes += [100.0 - i * 5 for i in range(1, 9)]
+    # Recovery: three strong green bars.
+    closes += [65.0, 75.0, 85.0]
+    return closes
+
+
+def test_rsi_recovery_fires_after_dip_then_rebound():
+    closes = _crash_then_recover_closes()
+    assert detect_rsi_recovery(closes, period=14, lookback=5) is True
+
+
+def test_rsi_recovery_false_when_still_oversold():
+    # Pure descent — RSI stays oversold, no recovery.
+    closes = [100.0 - i for i in range(40)]
+    assert detect_rsi_recovery(closes, period=14, lookback=5) is False
+
+
+def test_rsi_recovery_false_when_no_recent_dip():
+    # Flat-then-up — RSI never enters oversold, so nothing to recover from.
+    closes = [100.0] * 20 + [100.0 + i * 0.5 for i in range(1, 15)]
+    assert detect_rsi_recovery(closes, period=14, lookback=5) is False
+
+
+def test_rsi_recovery_false_with_insufficient_history():
+    closes = [100.0, 99.0, 98.0]  # way under period + lookback
+    assert detect_rsi_recovery(closes, period=14, lookback=5) is False
+
+
+# ---------- detect_high_reclaim ----------
+
+def _candle(idx: int, h: float, c: float) -> Candle:
+    return Candle(
+        open_time=f"t-{idx:04d}",
+        open=c,
+        high=h,
+        low=min(c, h),
+        close=c,
+        volume=100.0,
+        close_time=f"t-{idx:04d}c",
+    )
+
+
+def test_high_reclaim_fires_when_close_exceeds_prior_window_high():
+    # 10 prior candles with highs around 100, then a final close at 105.
+    candles = [_candle(i, 100.0, 99.0) for i in range(10)]
+    candles.append(_candle(10, 105.0, 105.0))
+    assert detect_high_reclaim(candles, lookback=10) is True
+
+
+def test_high_reclaim_false_when_close_at_or_below_prior_high():
+    candles = [_candle(i, 100.0, 99.0) for i in range(10)]
+    # Close exactly equal to the prior window's max high — strict inequality required.
+    candles.append(_candle(10, 100.0, 100.0))
+    assert detect_high_reclaim(candles, lookback=10) is False
+
+
+def test_high_reclaim_false_with_insufficient_history():
+    candles = [_candle(i, 100.0, 99.0) for i in range(5)]
+    assert detect_high_reclaim(candles, lookback=10) is False
+
+
+def test_high_reclaim_excludes_latest_candle_from_comparison_window():
+    # Latest candle's own high (110) is huge but it must reclaim only
+    # the *prior* window's max (100).
+    candles = [_candle(i, 100.0, 99.0) for i in range(10)]
+    candles.append(_candle(10, 110.0, 105.0))
+    assert detect_high_reclaim(candles, lookback=10) is True

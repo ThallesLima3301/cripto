@@ -309,6 +309,9 @@ def test_missing_future_candles_yield_none_and_pending_verdict(
     assert result.return_7d_pct is None
     assert result.max_gain_7d_pct is None
     assert result.max_loss_7d_pct is None
+    # Block 24: timing fields stay None when the window has no candles.
+    assert result.time_to_mfe_hours is None
+    assert result.time_to_mae_hours is None
     assert result.verdict == VERDICT_PENDING
 
 
@@ -339,3 +342,112 @@ def test_rerunning_evaluation_is_a_noop(memory_db, eval_settings):
         "SELECT COUNT(*) FROM signal_evaluations WHERE signal_id = ?",
         (signal_id,),
     ).fetchone()[0] == 1
+
+
+# ---------- Block 24: MFE/MAE timing ----------
+
+def test_mfe_and_mae_timing_match_seeded_window(memory_db, eval_settings):
+    """Signal eval pins the bar that produced the MFE / MAE.
+
+    The standard seed places the high mid-window (+3d → 72h) and the
+    low later (+4d → 96h). Block 24 must surface those offsets on the
+    result and persist them on the row.
+    """
+    anchor = datetime(2026, 3, 1, 14, 0, tzinfo=UTC)
+    signal_id = _insert_signal(
+        memory_db, candle_hour="2026-03-01T14:00:00Z", price=40.0
+    )
+    _seed_future_candles(
+        memory_db,
+        symbol="BTCUSDT",
+        anchor=anchor,
+        price_at_signal=40.0,
+        price_24h=41.0,
+        price_7d=44.0,
+        price_30d=48.0,
+        window_7d_high=50.0,
+        window_7d_low=38.0,
+    )
+
+    now = anchor + timedelta(days=31)
+    result = evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings, now=now
+    )
+
+    assert result is not None
+    assert result.max_gain_7d_pct == pytest.approx(25.0)
+    assert result.max_loss_7d_pct == pytest.approx(-5.0)
+    # +3d high → 72 hours; +4d low → 96 hours.
+    assert result.time_to_mfe_hours == pytest.approx(72.0)
+    assert result.time_to_mae_hours == pytest.approx(96.0)
+
+    row = memory_db.execute(
+        "SELECT time_to_mfe_hours, time_to_mae_hours "
+        "FROM signal_evaluations WHERE signal_id = ?",
+        (signal_id,),
+    ).fetchone()
+    assert row["time_to_mfe_hours"] == pytest.approx(72.0)
+    assert row["time_to_mae_hours"] == pytest.approx(96.0)
+
+
+def test_timing_uses_earliest_bar_on_tie(memory_db, eval_settings):
+    """When two bars share the extreme value the EARLIEST one wins."""
+    anchor = datetime(2026, 3, 1, 14, 0, tzinfo=UTC)
+    signal_id = _insert_signal(
+        memory_db, candle_hour="2026-03-01T14:00:00Z", price=100.0
+    )
+    # Place the same high at +24h and +96h. The implementation must
+    # return 24h for time_to_mfe_hours.
+    _insert_candle(
+        memory_db, symbol="BTCUSDT",
+        open_time=anchor,
+        open_=100.0, high=100.0, low=100.0, close=100.0,
+    )
+    _insert_candle(
+        memory_db, symbol="BTCUSDT",
+        open_time=anchor + timedelta(hours=24),
+        open_=120.0, high=120.0, low=120.0, close=120.0,
+    )
+    _insert_candle(
+        memory_db, symbol="BTCUSDT",
+        open_time=anchor + timedelta(hours=96),
+        open_=120.0, high=120.0, low=120.0, close=120.0,
+    )
+    # Need a 7d-later anchor so return_7d_pct can be computed (the
+    # verdict path doesn't drive this test, but the row insert needs
+    # *some* candle past the 7d window to mirror real usage).
+    _insert_candle(
+        memory_db, symbol="BTCUSDT",
+        open_time=anchor + timedelta(days=7),
+        open_=120.0, high=120.0, low=120.0, close=120.0,
+    )
+    memory_db.commit()
+
+    now = anchor + timedelta(days=31)
+    result = evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings, now=now
+    )
+    assert result is not None
+    assert result.time_to_mfe_hours == pytest.approx(24.0)
+
+
+def test_window_with_only_anchor_candle_zero_offsets(memory_db, eval_settings):
+    """A single bar at the anchor produces 0-hour offsets, not None."""
+    anchor = datetime(2026, 3, 1, 14, 0, tzinfo=UTC)
+    signal_id = _insert_signal(
+        memory_db, candle_hour="2026-03-01T14:00:00Z", price=100.0
+    )
+    _insert_candle(
+        memory_db, symbol="BTCUSDT",
+        open_time=anchor,
+        open_=100.0, high=110.0, low=90.0, close=100.0,
+    )
+    memory_db.commit()
+
+    now = anchor + timedelta(days=31)
+    result = evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings, now=now
+    )
+    assert result is not None
+    assert result.time_to_mfe_hours == pytest.approx(0.0)
+    assert result.time_to_mae_hours == pytest.approx(0.0)

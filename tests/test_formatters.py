@@ -12,8 +12,12 @@ from __future__ import annotations
 import pytest
 
 from crypto_monitor.notifications.formatters import (
+    SELL_PRIORITY_BY_SEVERITY,
+    SELL_PRIORITY_DEFAULT,
     format_alert_body,
     format_alert_title,
+    format_sell_alert_body,
+    format_sell_alert_title,
     format_weekly_body,
     format_weekly_title,
     friendly_name,
@@ -359,3 +363,124 @@ def test_weekly_body_debug_appends_raw_block():
     assert "signal_count=3" in body
     assert "top_drop=BTCUSDT" in body
     assert "matured=2" in body
+
+
+# ---------- sell formatter (Block 21) ----------
+
+def _sell_row(
+    *,
+    symbol: str = "BTCUSDT",
+    rule: str = "stop_loss",
+    severity: str = "high",
+    price: float = 85.0,
+    pnl: float | None = -15.0,
+    regime: str | None = "risk_off",
+    reason: str = "stop-loss: price 85 <= 92 (entry 100, pnl -15.00%)",
+    buy_id: int = 1,
+    detected_at: str = "2026-04-23T15:00:00Z",
+) -> dict:
+    return {
+        "id": 1,
+        "symbol": symbol,
+        "buy_id": buy_id,
+        "detected_at": detected_at,
+        "price_at_signal": price,
+        "rule_triggered": rule,
+        "severity": severity,
+        "reason": reason,
+        "pnl_pct": pnl,
+        "regime_at_signal": regime,
+        "alerted": 0,
+    }
+
+
+class TestSellAlertTitle:
+
+    def test_stop_loss_title(self):
+        t = format_sell_alert_title("BTCUSDT", "stop_loss")
+        assert "Stop-loss" in t
+        assert "BTC" in t
+
+    def test_take_profit_title(self):
+        t = format_sell_alert_title("ETHUSDT", "take_profit")
+        assert "Take-profit" in t
+        assert "ETH" in t
+
+    def test_trailing_stop_title(self):
+        t = format_sell_alert_title("SOLUSDT", "trailing_stop")
+        assert "Trailing stop" in t or "Trailing" in t
+        assert "SOL" in t
+
+    def test_context_deterioration_title(self):
+        t = format_sell_alert_title("BTCUSDT", "context_deterioration")
+        assert "Contexto" in t
+
+    def test_unknown_rule_uses_fallback(self):
+        t = format_sell_alert_title("BTCUSDT", "brand_new_rule")
+        assert "venda" in t.lower()
+
+    def test_debug_appends_pair_and_rule(self):
+        t = format_sell_alert_title("BTCUSDT", "stop_loss", debug=True)
+        assert "BTCUSDT" in t
+        assert "stop_loss" in t
+
+
+class TestSellAlertBody:
+
+    def test_body_includes_price_and_pnl_and_reason(self):
+        body = format_sell_alert_body(_sell_row())
+        assert "BTC" in body
+        assert "85" in body
+        assert "-15" in body  # loss
+        assert "stop-loss" in body.lower()
+
+    def test_body_with_gain_uses_plus_sign(self):
+        body = format_sell_alert_body(
+            _sell_row(rule="take_profit", price=120.0, pnl=20.0)
+        )
+        assert "+20" in body
+
+    def test_body_includes_regime_when_set(self):
+        body = format_sell_alert_body(_sell_row(regime="risk_off"))
+        assert "risk-off" in body.lower() or "adverso" in body.lower()
+
+    def test_body_omits_regime_when_none(self):
+        body = format_sell_alert_body(_sell_row(regime=None))
+        # No Portuguese regime line should appear.
+        assert "risk-off" not in body.lower()
+        assert "adverso" not in body.lower()
+
+    def test_body_has_rule_specific_conclusion(self):
+        stop = format_sell_alert_body(_sell_row(rule="stop_loss"))
+        tp = format_sell_alert_body(
+            _sell_row(rule="take_profit", price=120.0, pnl=20.0)
+        )
+        trail = format_sell_alert_body(
+            _sell_row(rule="trailing_stop", price=135.0, pnl=35.0)
+        )
+        ctx = format_sell_alert_body(
+            _sell_row(rule="context_deterioration", price=97.0, pnl=-3.0)
+        )
+        assert stop != tp != trail != ctx
+        assert "proteger capital" in stop
+        assert "realizar lucro" in tp
+        assert "Travar lucro" in trail or "travar lucro" in trail
+        assert "reavaliar" in ctx.lower()
+
+    def test_body_debug_appends_raw_block(self):
+        body = format_sell_alert_body(_sell_row(), debug=True)
+        assert "--- debug ---" in body
+        assert "rule=stop_loss" in body
+        assert "severity=high" in body
+
+
+class TestSellPriorityMap:
+
+    def test_high_maps_to_max_priority(self):
+        assert SELL_PRIORITY_BY_SEVERITY["high"] == "max"
+
+    def test_medium_maps_to_high_priority(self):
+        assert SELL_PRIORITY_BY_SEVERITY["medium"] == "high"
+
+    def test_unknown_severity_falls_back_to_default(self):
+        assert SELL_PRIORITY_BY_SEVERITY.get("xxx", SELL_PRIORITY_DEFAULT) == "default"

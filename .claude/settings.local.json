@@ -36,7 +36,20 @@
       "Bash(python -c \"from crypto_monitor.scheduler.entrypoints import run_scan; print\\('OK'\\)\")",
       "Bash(python -m pytest tests/test_regime.py -v)",
       "Bash(python -m pytest tests/ -v --tb=short)",
-      "Bash(python -m pytest -x -q)"
+      "Bash(python -m pytest -x -q)",
+      "Bash(python -m pytest tests/test_factors_v2.py -v)",
+      "Bash(python -m pytest tests/test_signal_engine.py tests/test_regime.py -q)",
+      "Bash(python -m pytest tests/test_sell_store.py -q)",
+      "Bash(git -C \"c:/Users/Pichau/Desktop/cript\" log --oneline --all)",
+      "Bash(python -m pytest tests/test_sell_engine.py -q)",
+      "Bash(python -m pytest tests/test_sell_runtime.py tests/test_formatters.py tests/test_cli.py -q)",
+      "Bash(python -m pytest tests/test_watchlist.py -q)",
+      "Bash(python -m pytest tests/test_watchlist_runtime.py tests/test_cli.py -q)",
+      "Bash(python -m pytest tests/test_signal_evaluation.py tests/test_buy_evaluation.py -q)",
+      "Bash(python -m pytest tests/test_analytics_aggregator.py -q)",
+      "Bash(python -m pytest tests/test_weekly_summary.py tests/test_cli.py tests/test_formatters.py -q)",
+      "Bash(python -m pytest tests/test_analytics_reporter.py tests/test_cli.py tests/test_weekly_summary.py -q)",
+      "Bash(python -c ' *)"
     ]
   }
 }

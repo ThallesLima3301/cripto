@@ -394,3 +394,123 @@ def test_rerunning_buy_evaluation_is_a_noop(memory_db, eval_settings):
     assert memory_db.execute(
         "SELECT COUNT(*) FROM buy_evaluations WHERE buy_id = ?", (buy.id,)
     ).fetchone()[0] == 1
+
+
+# ---------- Block 24: MFE / MAE + timing on buy_evaluations ----------
+
+def test_buy_eval_records_mfe_mae_and_timing(memory_db, eval_settings):
+    """Buy eval mirrors signal eval: MFE / MAE + timing over [bought_at, +7d]."""
+    bought_at = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+    buy = insert_buy(
+        memory_db,
+        symbol="BTCUSDT",
+        bought_at=bought_at,
+        price=100.0,
+        amount_invested=1000.0,
+        now=bought_at,
+    )
+
+    # Seed the candles the evaluator looks up. We deliberately put the
+    # 7d-later candle at a price low enough that it does NOT also win
+    # MAE (we want a distinct MAE bar mid-window).
+    def _put(open_time: datetime, *, o: float, h: float, l: float, c: float) -> None:
+        memory_db.execute(
+            """
+            INSERT INTO candles
+                (symbol, interval, open_time, open, high, low, close, volume, close_time)
+            VALUES ('BTCUSDT', '1h', ?, ?, ?, ?, ?, 100.0, ?)
+            """,
+            (
+                open_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                o, h, l, c,
+                (open_time + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            ),
+        )
+
+    # Anchor candle at the buy time.
+    _put(bought_at, o=100.0, h=100.0, l=100.0, c=100.0)
+    # MFE bar at +48h with high=130 → max_gain_pct = 30, time_to_mfe_hours = 48.
+    _put(bought_at + timedelta(hours=48),
+         o=125.0, h=130.0, l=125.0, c=128.0)
+    # MAE bar at +120h with low=85 → max_loss_pct = -15, time_to_mae_hours = 120.
+    _put(bought_at + timedelta(hours=120),
+         o=95.0, h=98.0, l=85.0, c=90.0)
+    # 7d-later candle: open=close=high=low=110 (won't beat MFE/MAE extremes).
+    _put(bought_at + timedelta(days=7),
+         o=110.0, h=110.0, l=110.0, c=110.0)
+    # 30d-later candle for the existing return_30d_pct field.
+    _put(bought_at + timedelta(days=30),
+         o=120.0, h=120.0, l=120.0, c=120.0)
+    memory_db.commit()
+
+    now = bought_at + timedelta(days=31)
+    result = evaluate_buy(
+        memory_db, buy.id, eval_settings=eval_settings, now=now
+    )
+
+    assert result is not None
+    assert result.max_gain_pct == pytest.approx(30.0)
+    assert result.max_loss_pct == pytest.approx(-15.0)
+    assert result.time_to_mfe_hours == pytest.approx(48.0)
+    assert result.time_to_mae_hours == pytest.approx(120.0)
+
+    row = memory_db.execute(
+        "SELECT max_gain_pct, max_loss_pct, "
+        "time_to_mfe_hours, time_to_mae_hours "
+        "FROM buy_evaluations WHERE buy_id = ?",
+        (buy.id,),
+    ).fetchone()
+    assert row["max_gain_pct"] == pytest.approx(30.0)
+    assert row["max_loss_pct"] == pytest.approx(-15.0)
+    assert row["time_to_mfe_hours"] == pytest.approx(48.0)
+    assert row["time_to_mae_hours"] == pytest.approx(120.0)
+
+
+def test_buy_eval_mfe_mae_null_when_no_future_candles(memory_db, eval_settings):
+    """No candles inside [bought_at, bought_at+7d] -> all four columns NULL."""
+    bought_at = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+    buy = insert_buy(
+        memory_db,
+        symbol="BTCUSDT",
+        bought_at=bought_at,
+        price=100.0,
+        amount_invested=1000.0,
+        now=bought_at,
+    )
+    now = bought_at + timedelta(days=31)
+    result = evaluate_buy(
+        memory_db, buy.id, eval_settings=eval_settings, now=now
+    )
+    assert result is not None
+    assert result.max_gain_pct is None
+    assert result.max_loss_pct is None
+    assert result.time_to_mfe_hours is None
+    assert result.time_to_mae_hours is None
+
+    row = memory_db.execute(
+        "SELECT max_gain_pct, time_to_mfe_hours FROM buy_evaluations "
+        "WHERE buy_id = ?",
+        (buy.id,),
+    ).fetchone()
+    assert row["max_gain_pct"] is None
+    assert row["time_to_mfe_hours"] is None
+
+
+# ---------- Block 24: migration 005 idempotency ----------
+
+def test_migration_005_added_columns_and_is_idempotent(memory_db):
+    """The new columns ship with the schema; re-running migrations is a no-op."""
+    from crypto_monitor.database.migrations import column_exists, run_migrations
+
+    for col in ("time_to_mfe_hours", "time_to_mae_hours"):
+        assert column_exists(memory_db, "signal_evaluations", col)
+    for col in (
+        "max_gain_pct", "max_loss_pct",
+        "time_to_mfe_hours", "time_to_mae_hours",
+    ):
+        assert column_exists(memory_db, "buy_evaluations", col)
+
+    # Re-running run_migrations after the schema is already at the
+    # latest version must report no steps applied.
+    report = run_migrations(memory_db)
+    assert report.steps_applied == ()

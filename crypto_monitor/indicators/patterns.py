@@ -1,7 +1,7 @@
-"""Reversal candlestick pattern detection.
+"""Reversal candlestick pattern detection + confirmation helpers.
 
-Three patterns, in priority order (highest priority first because
-`detect_reversal` returns at most one):
+Three candlestick patterns, in priority order (highest priority first
+because `detect_reversal` returns at most one):
 
   1. Hammer        — small body, long lower wick (>=2x body), tiny upper wick.
                      Strongest local-bottom signal.
@@ -10,13 +10,21 @@ Three patterns, in priority order (highest priority first because
   3. Doji          — open ~= close (body <= 10% of total range). Indecision;
                      weak on its own but useful as confirmation.
 
-All checks are pure ratio rules over the candle's own OHLC values, so
-they're trivially testable and don't require any historical context
-beyond the previous candle (for engulfing).
+Two confirmation helpers added in Block 17:
+
+  * `detect_rsi_recovery`   — RSI dipped into oversold in the recent past
+                              and is back above the oversold threshold.
+  * `detect_high_reclaim`   — latest close exceeds the highest HIGH of the
+                              previous N bars, i.e. reclaims prior resistance.
+
+All candlestick checks are pure ratio rules over a candle's own OHLC.
+The confirmation helpers operate over short windows and never reach
+back further than their `lookback` parameter.
 """
 
 from __future__ import annotations
 
+from crypto_monitor.indicators.rsi import rsi
 from crypto_monitor.indicators.types import Candle, ReversalInfo
 
 
@@ -78,3 +86,67 @@ def detect_reversal(candles: list[Candle]) -> ReversalInfo:
         return ReversalInfo(True, "doji")
 
     return ReversalInfo(False, None)
+
+
+# ---------- confirmation helpers (Block 17) ----------
+
+def detect_rsi_recovery(
+    closes: list[float],
+    *,
+    period: int = 14,
+    oversold: float = 30.0,
+    lookback: int = 5,
+) -> bool:
+    """Return True when RSI recently dipped into oversold and has recovered.
+
+    Concretely: the current RSI is strictly above ``oversold`` AND at
+    least one of the ``lookback - 1`` preceding bars had an RSI value
+    at or below ``oversold``. The idea is a momentum turnaround: price
+    made a capitulation low (RSI ≤ 30) and buyers have now pushed RSI
+    back above the threshold.
+
+    Returns False when:
+      * there is not enough history to compute RSI for every lookback bar
+      * current RSI is itself still in oversold (no recovery)
+      * no recent bar was oversold (no dip to recover from)
+    """
+    if lookback < 2:
+        return False
+    if len(closes) < period + lookback:
+        return False
+
+    rsi_now = rsi(closes, period=period)
+    if rsi_now is None or rsi_now <= oversold:
+        return False
+
+    # Walk back `lookback - 1` bars; if any past RSI reading was oversold,
+    # the current reading represents a recovery.
+    for k in range(1, lookback):
+        rsi_past = rsi(closes[:-k], period=period)
+        if rsi_past is not None and rsi_past <= oversold:
+            return True
+    return False
+
+
+def detect_high_reclaim(
+    candles: list[Candle],
+    *,
+    lookback: int = 10,
+) -> bool:
+    """Return True when the latest close reclaims a prior local high.
+
+    Specifically: the latest candle's ``close`` is strictly greater
+    than the maximum ``high`` across the previous ``lookback`` candles
+    (the latest candle itself is excluded from the comparison window).
+
+    Returns False when there is not enough history (``len(candles) <
+    lookback + 1``) or the latest close fails to exceed prior resistance.
+    """
+    if lookback < 1:
+        return False
+    if len(candles) < lookback + 1:
+        return False
+    latest_close = candles[-1].close
+    window = candles[-(lookback + 1):-1]
+    prior_high = max(c.high for c in window)
+    return latest_close > prior_high

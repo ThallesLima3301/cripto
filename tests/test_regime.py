@@ -26,8 +26,10 @@ from crypto_monitor.config.settings import (
     IntervalsSettings,
     RegimeSettings,
     RetentionSettings,
+    SellSettings,
     Settings,
     SymbolsSettings,
+    WatchlistSettings,
 )
 from crypto_monitor.database.connection import get_connection
 from crypto_monitor.database.migrations import (
@@ -470,6 +472,19 @@ class TestSchedulerRegimeWiring:
             ),
             evaluation=eval_settings,
             regime=regime,
+            sell=SellSettings(
+                enabled=False,
+                stop_loss_pct=8.0,
+                take_profit_pct=20.0,
+                trailing_stop_pct=10.0,
+                context_deterioration=True,
+                cooldown_hours=6,
+            ),
+            watchlist=WatchlistSettings(
+                enabled=False,
+                floor_score=35,
+                max_watch_hours=48,
+            ),
         )
 
     def test_btc_seeded_when_regime_enabled_but_not_tracked(
@@ -770,6 +785,257 @@ class TestSchedulerRegimeWiring:
         # ETHUSDT was scored, BTCUSDT was NOT
         assert "ETHUSDT" in scored_symbols
         assert "BTCUSDT" not in scored_symbols
+        conn.close()
+
+    def _seed_eth_1h_history(self, conn) -> None:
+        """Seed ETHUSDT into symbols + 30 1h candles so the scoring loop fires."""
+        seed_default_symbols(conn, ["ETHUSDT"])
+        base = datetime(2025, 3, 1, tzinfo=UTC)
+        for i in range(30):
+            dt = base + timedelta(hours=i)
+            ts = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                """INSERT OR IGNORE INTO candles
+                   (symbol, interval, open_time, open, high, low,
+                    close, volume, close_time)
+                   VALUES (?, '1h', ?, 100, 101, 99, 100, 1000, ?)""",
+                ("ETHUSDT", ts, ts),
+            )
+        conn.commit()
+
+    def _capture_score_signal_kwargs(self) -> tuple[list[dict], Any]:
+        """Monkey-patch ep.score_signal to record every kwargs dict it sees."""
+        captured: list[dict] = []
+        import crypto_monitor.scheduler.entrypoints as ep
+        original = ep.score_signal
+
+        def _spy(symbol, *a, **kw):
+            captured.append(dict(kw))
+            return original(symbol, *a, **kw)
+
+        ep.score_signal = _spy
+        return captured, original
+
+    def _restore_score_signal(self, original: Any) -> None:
+        import crypto_monitor.scheduler.entrypoints as ep
+        ep.score_signal = original
+
+    def _seed_btc_for_regime(self, conn, builder) -> None:
+        """Seed BTCUSDT + 100 1d candles produced by ``builder``."""
+        seed_default_symbols(conn, ["BTCUSDT"])
+        for candle in builder(100):
+            conn.execute(
+                """INSERT OR IGNORE INTO candles
+                   (symbol, interval, open_time, open, high, low, close,
+                    volume, close_time)
+                   VALUES (?, '1d', ?, ?, ?, ?, ?, ?, ?)""",
+                ("BTCUSDT", candle.open_time, candle.open,
+                 candle.high, candle.low, candle.close,
+                 candle.volume, candle.close_time),
+            )
+        conn.commit()
+
+    def test_risk_on_passes_negative_adjust_to_score_signal(
+        self,
+        tmp_path,
+        _regime_settings,
+        scoring_settings,
+        alerts_settings,
+        ntfy_settings,
+        eval_settings,
+    ):
+        """A risk_on snapshot must threading `threshold_adjust_risk_on` (-5)
+        into every `score_signal` call."""
+        from crypto_monitor.scheduler.entrypoints import run_scan
+
+        settings = self._make_settings(
+            tmp_path,
+            regime=_regime_settings,
+            scoring_settings=scoring_settings,
+            alerts_settings=alerts_settings,
+            ntfy_settings=ntfy_settings,
+            eval_settings=eval_settings,
+            tracked=("ETHUSDT",),
+        )
+
+        conn = get_connection(":memory:")
+        init_db(conn)
+        run_migrations(conn)
+        self._seed_eth_1h_history(conn)
+        self._seed_btc_for_regime(conn, _make_btc_uptrend)  # -> risk_on
+
+        captured, original = self._capture_score_signal_kwargs()
+        try:
+            class _NoOpClient:
+                def get_klines(self, *a: Any, **kw: Any) -> list:
+                    return []
+
+            report = run_scan(
+                settings=settings,
+                conn=conn,
+                client=_NoOpClient(),
+                sender=lambda *a, **kw: SendResult(sent=False, reason="stub"),
+            )
+        finally:
+            self._restore_score_signal(original)
+
+        assert report.regime_snapshot is not None
+        assert report.regime_snapshot.label == "risk_on"
+        assert captured, "score_signal was never invoked"
+        for kw in captured:
+            assert kw.get("regime_at_signal") == "risk_on"
+            assert kw.get("min_score_adjust") == -5
+        conn.close()
+
+    def test_risk_off_passes_positive_adjust_to_score_signal(
+        self,
+        tmp_path,
+        _regime_settings,
+        scoring_settings,
+        alerts_settings,
+        ntfy_settings,
+        eval_settings,
+    ):
+        """A risk_off snapshot must thread `threshold_adjust_risk_off` (+5)."""
+        from crypto_monitor.scheduler.entrypoints import run_scan
+
+        settings = self._make_settings(
+            tmp_path,
+            regime=_regime_settings,
+            scoring_settings=scoring_settings,
+            alerts_settings=alerts_settings,
+            ntfy_settings=ntfy_settings,
+            eval_settings=eval_settings,
+            tracked=("ETHUSDT",),
+        )
+
+        conn = get_connection(":memory:")
+        init_db(conn)
+        run_migrations(conn)
+        self._seed_eth_1h_history(conn)
+        self._seed_btc_for_regime(conn, _make_btc_downtrend)  # -> risk_off
+
+        captured, original = self._capture_score_signal_kwargs()
+        try:
+            class _NoOpClient:
+                def get_klines(self, *a: Any, **kw: Any) -> list:
+                    return []
+
+            report = run_scan(
+                settings=settings,
+                conn=conn,
+                client=_NoOpClient(),
+                sender=lambda *a, **kw: SendResult(sent=False, reason="stub"),
+            )
+        finally:
+            self._restore_score_signal(original)
+
+        assert report.regime_snapshot is not None
+        assert report.regime_snapshot.label == "risk_off"
+        assert captured
+        for kw in captured:
+            assert kw.get("regime_at_signal") == "risk_off"
+            assert kw.get("min_score_adjust") == 5
+        conn.close()
+
+    def test_neutral_passes_zero_adjust_to_score_signal(
+        self,
+        tmp_path,
+        _regime_settings,
+        scoring_settings,
+        alerts_settings,
+        ntfy_settings,
+        eval_settings,
+    ):
+        """A neutral snapshot must NOT shift the emit floor."""
+        from crypto_monitor.scheduler.entrypoints import run_scan
+
+        settings = self._make_settings(
+            tmp_path,
+            regime=_regime_settings,
+            scoring_settings=scoring_settings,
+            alerts_settings=alerts_settings,
+            ntfy_settings=ntfy_settings,
+            eval_settings=eval_settings,
+            tracked=("ETHUSDT",),
+        )
+
+        conn = get_connection(":memory:")
+        init_db(conn)
+        run_migrations(conn)
+        self._seed_eth_1h_history(conn)
+        self._seed_btc_for_regime(conn, _make_btc_sideways)  # -> neutral
+
+        captured, original = self._capture_score_signal_kwargs()
+        try:
+            class _NoOpClient:
+                def get_klines(self, *a: Any, **kw: Any) -> list:
+                    return []
+
+            report = run_scan(
+                settings=settings,
+                conn=conn,
+                client=_NoOpClient(),
+                sender=lambda *a, **kw: SendResult(sent=False, reason="stub"),
+            )
+        finally:
+            self._restore_score_signal(original)
+
+        assert report.regime_snapshot is not None
+        assert report.regime_snapshot.label == "neutral"
+        assert captured
+        for kw in captured:
+            assert kw.get("regime_at_signal") == "neutral"
+            assert kw.get("min_score_adjust") == 0
+        conn.close()
+
+    def test_regime_disabled_passes_zero_adjust_and_no_label(
+        self,
+        tmp_path,
+        _regime_disabled,
+        scoring_settings,
+        alerts_settings,
+        ntfy_settings,
+        eval_settings,
+    ):
+        """Feature flag off: even if config has non-zero adjusts, none apply."""
+        from crypto_monitor.scheduler.entrypoints import run_scan
+
+        settings = self._make_settings(
+            tmp_path,
+            regime=_regime_disabled,
+            scoring_settings=scoring_settings,
+            alerts_settings=alerts_settings,
+            ntfy_settings=ntfy_settings,
+            eval_settings=eval_settings,
+            tracked=("ETHUSDT",),
+        )
+
+        conn = get_connection(":memory:")
+        init_db(conn)
+        run_migrations(conn)
+        self._seed_eth_1h_history(conn)
+
+        captured, original = self._capture_score_signal_kwargs()
+        try:
+            class _NoOpClient:
+                def get_klines(self, *a: Any, **kw: Any) -> list:
+                    return []
+
+            report = run_scan(
+                settings=settings,
+                conn=conn,
+                client=_NoOpClient(),
+                sender=lambda *a, **kw: SendResult(sent=False, reason="stub"),
+            )
+        finally:
+            self._restore_score_signal(original)
+
+        assert report.regime_snapshot is None
+        assert captured
+        for kw in captured:
+            assert kw.get("regime_at_signal") is None
+            assert kw.get("min_score_adjust") == 0
         conn.close()
 
     def test_btc_scored_when_explicitly_tracked(

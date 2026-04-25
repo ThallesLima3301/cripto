@@ -10,7 +10,9 @@ The signal engine in `crypto_monitor.signals` is the only consumer.
 
 from crypto_monitor.indicators.atr import atr, true_range
 from crypto_monitor.indicators.patterns import (
+    detect_high_reclaim,
     detect_reversal,
+    detect_rsi_recovery,
     is_bullish_engulfing,
     is_doji,
     is_hammer,
@@ -33,6 +35,8 @@ __all__ = [
     "trend_label",
     "find_heuristic_support",
     "detect_reversal",
+    "detect_rsi_recovery",
+    "detect_high_reclaim",
     "is_hammer",
     "is_doji",
     "is_bullish_engulfing",

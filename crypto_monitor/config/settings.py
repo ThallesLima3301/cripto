@@ -159,6 +159,40 @@ class RegimeSettings:
 
 
 @dataclass(frozen=True)
+class WatchlistSettings:
+    """Watchlist configuration (Block 22, schema + state-machine only).
+
+    The watchlist captures "borderline" scores — below the regular
+    emit floor but above ``floor_score`` — so they can be promoted if
+    the score climbs past the emit floor within ``max_watch_hours``,
+    or quietly expire otherwise. When ``enabled`` is False the
+    subsystem is inert regardless of the other fields.
+    """
+    enabled: bool
+    floor_score: int
+    max_watch_hours: int
+
+
+@dataclass(frozen=True)
+class SellSettings:
+    """Sell-engine configuration (Block 19, schema only).
+
+    The Block 19 surface is data-model only: these fields are parsed and
+    surfaced on ``Settings.sell`` so later blocks can flip rules on
+    without another config migration. When ``enabled`` is False the
+    sell subsystem stays inert regardless of the other thresholds.
+
+    All percentages are in percent (``5.0`` means 5%), positive numbers.
+    """
+    enabled: bool
+    stop_loss_pct: float
+    take_profit_pct: float
+    trailing_stop_pct: float
+    context_deterioration: bool
+    cooldown_hours: int
+
+
+@dataclass(frozen=True)
 class Settings:
     project_root: Path
     general: GeneralSettings
@@ -171,6 +205,8 @@ class Settings:
     retention: RetentionSettings
     evaluation: EvaluationSettings
     regime: RegimeSettings
+    sell: SellSettings
+    watchlist: WatchlistSettings
 
 
 # ---------- loader ----------
@@ -357,6 +393,23 @@ def load_settings(project_root: Path) -> Settings:
         threshold_adjust_risk_off=int(rg.get("threshold_adjust_risk_off", 5)),
     )
 
+    sl = raw.get("sell", {})
+    sell = SellSettings(
+        enabled=bool(sl.get("enabled", False)),
+        stop_loss_pct=float(sl.get("stop_loss_pct", 8.0)),
+        take_profit_pct=float(sl.get("take_profit_pct", 20.0)),
+        trailing_stop_pct=float(sl.get("trailing_stop_pct", 10.0)),
+        context_deterioration=bool(sl.get("context_deterioration", True)),
+        cooldown_hours=int(sl.get("cooldown_hours", 6)),
+    )
+
+    wl = raw.get("watchlist", {})
+    watchlist = WatchlistSettings(
+        enabled=bool(wl.get("enabled", False)),
+        floor_score=int(wl.get("floor_score", 35)),
+        max_watch_hours=int(wl.get("max_watch_hours", 48)),
+    )
+
     return Settings(
         project_root=project_root,
         general=general,
@@ -369,4 +422,6 @@ def load_settings(project_root: Path) -> Settings:
         retention=retention,
         evaluation=evaluation,
         regime=regime,
+        sell=sell,
+        watchlist=watchlist,
     )

@@ -138,3 +138,39 @@ atr_lookback     = 90
 atr_high_percentile      = 70.0
 threshold_adjust_risk_on  = -5
 threshold_adjust_risk_off = 5
+
+[watchlist]
+# Watchlist for borderline setups. When a symbol scores below the
+# regular emit floor (`scoring.thresholds.min_signal_score`) but at or
+# above `floor_score`, the scheduler can park it here until either
+# the score climbs past the emit floor (promotion) or `max_watch_hours`
+# elapses (expiration). Block 22 ships the schema and state machine;
+# scheduler wiring lands in a later block. Leaving `enabled = false`
+# keeps the subsystem inert.
+enabled = false
+# Lowest score worth watching. Scores below this are ignored entirely.
+floor_score = 35
+# How long an active watch stays open before it ages out.
+max_watch_hours = 48
+
+[sell]
+# Sell-engine configuration. The schema and persistence layer ship in
+# Block 19; rule evaluation, scheduler wiring, and notifications follow
+# in later blocks. Leaving `enabled = false` keeps the subsystem inert.
+enabled = false
+# Hard stop: emit a sell signal when the loss vs. entry price exceeds
+# this percent (positive number — a 8.0 means a 8% drawdown).
+stop_loss_pct = 8.0
+# Take-profit target: emit when the gain vs. entry price exceeds this
+# percent.
+take_profit_pct = 20.0
+# Trailing stop: emit when price falls this many percent from the
+# observed post-entry high (the "high watermark").
+trailing_stop_pct = 10.0
+# When true, a meaningful deterioration of the broader scoring context
+# (e.g. regime flipping to risk_off, trend rolling over) can also fire
+# a sell signal even outside of the price-driven rules above.
+context_deterioration = true
+# Minimum hours between consecutive sell signals on the same buy. Acts
+# as a per-position cooldown so a flapping price doesn't spam alerts.
+cooldown_hours = 6

@@ -43,6 +43,7 @@ from crypto_monitor.config.settings import EvaluationSettings
 from crypto_monitor.evaluation.verdict import assign_verdict
 from crypto_monitor.evaluation.signal_eval import (
     MATURATION_DAYS,
+    _max_gain_loss_with_timing,
     _pct_change,
     _price_at_or_after,
 )
@@ -125,6 +126,11 @@ class BuyEvalResult:
     return_30d_pct: float | None
     verdict: str
     resolution_note: str
+    # ---- Block 24: MFE/MAE over the 7-day post-buy window ----
+    max_gain_pct: float | None = None
+    max_loss_pct: float | None = None
+    time_to_mfe_hours: float | None = None
+    time_to_mae_hours: float | None = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +302,15 @@ def _compute_buy_eval(
     return_7d = _pct_change(buy_price, price_7d)
     return_30d = _pct_change(buy_price, price_30d)
 
+    # --- Block 24: MFE / MAE + timing over the 7-day post-buy window ---
+    max_gain_pct, max_loss_pct, t_to_mfe, t_to_mae = _max_gain_loss_with_timing(
+        conn,
+        symbol=symbol,
+        start=bought_at,
+        end=t_7d,
+        base=buy_price,
+    )
+
     verdict = assign_verdict(return_7d, eval_settings)
 
     return BuyEvalResult(
@@ -312,6 +327,10 @@ def _compute_buy_eval(
         return_30d_pct=return_30d,
         verdict=verdict,
         resolution_note=_RESOLUTION_NOTE,
+        max_gain_pct=max_gain_pct,
+        max_loss_pct=max_loss_pct,
+        time_to_mfe_hours=t_to_mfe,
+        time_to_mae_hours=t_to_mae,
     )
 
 
@@ -362,8 +381,10 @@ def _insert_buy_evaluation(
             buy_vs_day_low_hourly_pct,
             price_7d_later, return_7d_pct,
             price_30d_later, return_30d_pct,
-            verdict, resolution_note
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            verdict, resolution_note,
+            max_gain_pct, max_loss_pct,
+            time_to_mfe_hours, time_to_mae_hours
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             r.buy_id,
@@ -380,5 +401,9 @@ def _insert_buy_evaluation(
             r.return_30d_pct,
             r.verdict,
             r.resolution_note,
+            r.max_gain_pct,
+            r.max_loss_pct,
+            r.time_to_mfe_hours,
+            r.time_to_mae_hours,
         ),
     )

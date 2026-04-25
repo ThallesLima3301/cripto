@@ -492,6 +492,316 @@ def test_cmd_ntfy_test_failure(
 
 # ---------- argparse / dispatcher edge cases ----------
 
+# ---------- sell record / sell list ----------
+
+def test_sell_record_marks_buy_sold_and_is_listed_by_sell_list(
+    cli_project: Path,
+) -> None:
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+    _run(
+        "--project-root", str(cli_project),
+        "buy", "add",
+        "--symbol", "BTCUSDT",
+        "--price", "100",
+        "--amount", "1000",
+        "--bought-at", "2026-04-20T00:00:00Z",
+    )
+
+    # record the sale
+    code, out, err = _run(
+        "--project-root", str(cli_project),
+        "sell", "record",
+        "--buy-id", "1",
+        "--price", "115",
+        "--at", "2026-04-23T00:00:00Z",
+        "--note", "took profit",
+    )
+    assert code == 0, err
+    assert "recorded sale buy_id=1" in out
+    assert "price=115" in out
+
+    # buy list should now reflect the sold_at — buy list uses legacy
+    # columns only, so we check the raw DB instead.
+    from crypto_monitor.database.connection import get_connection
+    conn = get_connection(cli_project / "data" / "crypto_monitor.db")
+    try:
+        row = conn.execute(
+            "SELECT sold_at, sold_price, sold_note FROM buys WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["sold_at"] == "2026-04-23T00:00:00Z"
+    assert row["sold_price"] == 115.0
+    assert row["sold_note"] == "took profit"
+
+
+def test_sell_record_rejects_double_sell(cli_project: Path) -> None:
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+    _run(
+        "--project-root", str(cli_project),
+        "buy", "add",
+        "--symbol", "BTCUSDT",
+        "--price", "100",
+        "--amount", "1000",
+        "--bought-at", "2026-04-20T00:00:00Z",
+    )
+    _run(
+        "--project-root", str(cli_project),
+        "sell", "record",
+        "--buy-id", "1",
+        "--price", "115",
+        "--at", "2026-04-23T00:00:00Z",
+    )
+    code, _, err = _run(
+        "--project-root", str(cli_project),
+        "sell", "record",
+        "--buy-id", "1",
+        "--price", "120",
+        "--at", "2026-04-24T00:00:00Z",
+    )
+    assert code == 1
+    assert "already marked sold" in err
+
+
+def test_sell_list_empty_message(cli_project: Path) -> None:
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+    code, out, _ = _run(
+        "--project-root", str(cli_project), "sell", "list"
+    )
+    assert code == 0
+    assert "(no sell signals recorded)" in out
+
+
+def test_sell_list_renders_seeded_rows(cli_project: Path) -> None:
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+    _run(
+        "--project-root", str(cli_project),
+        "buy", "add",
+        "--symbol", "BTCUSDT",
+        "--price", "100",
+        "--amount", "1000",
+        "--bought-at", "2026-04-20T00:00:00Z",
+    )
+    # Hand-insert a sell_signals row so the list has something to render.
+    from crypto_monitor.database.connection import get_connection
+    from crypto_monitor.database.migrations import run_migrations
+    from crypto_monitor.database.schema import init_db
+    from crypto_monitor.sell import insert_sell_signal, SellSignal
+    conn = get_connection(cli_project / "data" / "crypto_monitor.db")
+    try:
+        init_db(conn)
+        run_migrations(conn)
+        insert_sell_signal(
+            conn,
+            SellSignal(
+                id=None,
+                symbol="BTCUSDT",
+                buy_id=1,
+                detected_at="2026-04-23T15:00:00Z",
+                price_at_signal=85.0,
+                rule_triggered="stop_loss",
+                severity="high",
+                reason="stop-loss fired",
+                pnl_pct=-15.0,
+                regime_at_signal="risk_off",
+            ),
+        )
+    finally:
+        conn.close()
+
+    code, out, _ = _run(
+        "--project-root", str(cli_project), "sell", "list"
+    )
+    assert code == 0, out
+    assert "BTCUSDT" in out
+    assert "stop_loss" in out
+    assert "high" in out
+    assert "85" in out
+
+
+def test_sell_list_filters_by_rule(cli_project: Path) -> None:
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+    _run(
+        "--project-root", str(cli_project),
+        "buy", "add",
+        "--symbol", "BTCUSDT",
+        "--price", "100",
+        "--amount", "1000",
+        "--bought-at", "2026-04-20T00:00:00Z",
+    )
+    from crypto_monitor.database.connection import get_connection
+    from crypto_monitor.database.migrations import run_migrations
+    from crypto_monitor.database.schema import init_db
+    from crypto_monitor.sell import insert_sell_signal, SellSignal
+    conn = get_connection(cli_project / "data" / "crypto_monitor.db")
+    try:
+        init_db(conn)
+        run_migrations(conn)
+        for rule in ("stop_loss", "take_profit"):
+            insert_sell_signal(
+                conn,
+                SellSignal(
+                    id=None, symbol="BTCUSDT", buy_id=1,
+                    detected_at="2026-04-23T15:00:00Z",
+                    price_at_signal=85.0 if rule == "stop_loss" else 125.0,
+                    rule_triggered=rule,
+                    severity="high" if rule == "stop_loss" else "medium",
+                    reason=f"{rule} fired",
+                    pnl_pct=-15.0 if rule == "stop_loss" else 25.0,
+                ),
+            )
+    finally:
+        conn.close()
+
+    code, out, _ = _run(
+        "--project-root", str(cli_project),
+        "sell", "list", "--rule", "take_profit",
+    )
+    assert code == 0
+    assert "take_profit" in out
+    assert "stop_loss" not in out
+
+
+# ---------- analytics summary ----------
+
+def _seed_signal_evaluation(
+    db_path: Path,
+    *,
+    symbol: str = "BTCUSDT",
+    detected_at: str = "2026-04-01T12:00:00Z",
+    return_pct: float = 5.0,
+    score: int = 70,
+    severity: str = "strong",
+) -> None:
+    """Insert a signal + matching signal_evaluation row."""
+    from crypto_monitor.database.connection import get_connection
+    from crypto_monitor.database.migrations import run_migrations
+    from crypto_monitor.database.schema import init_db
+
+    conn = get_connection(db_path)
+    try:
+        init_db(conn)
+        run_migrations(conn)
+        cur = conn.execute(
+            """
+            INSERT INTO signals (
+                symbol, detected_at, candle_hour, price_at_signal,
+                score, severity, trigger_reason, reversal_signal,
+                score_breakdown, dominant_trigger_timeframe,
+                regime_at_signal
+            ) VALUES (?, ?, ?, 100.0, ?, ?, 'test', 0, '{}', '7d', 'neutral')
+            """,
+            (symbol, detected_at, detected_at, score, severity),
+        )
+        signal_id = int(cur.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO signal_evaluations (
+                signal_id, evaluated_at, price_at_signal,
+                return_7d_pct, max_gain_7d_pct, max_loss_7d_pct,
+                time_to_mfe_hours, time_to_mae_hours, verdict
+            ) VALUES (?, ?, 100.0, ?, ?, ?, 24.0, 48.0, 'good')
+            """,
+            (signal_id, detected_at,
+             return_pct, return_pct + 5.0, return_pct - 5.0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_analytics_summary_with_no_data(cli_project: Path) -> None:
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+    code, out, _ = _run(
+        "--project-root", str(cli_project),
+        "analytics", "summary",
+    )
+    assert code == 0, out
+    assert "Analytics — 0 sinais" in out
+    assert "Sem dados disponíveis" in out
+
+
+def test_analytics_summary_with_populated_data(cli_project: Path) -> None:
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+    db_path = cli_project / "data" / "crypto_monitor.db"
+    # Two wins + two losses → WR 50%, expectancy positive.
+    _seed_signal_evaluation(db_path, symbol="BTCUSDT", return_pct=10.0)
+    _seed_signal_evaluation(db_path, symbol="ETHUSDT", return_pct=20.0)
+    _seed_signal_evaluation(db_path, symbol="SOLUSDT", return_pct=-5.0)
+    _seed_signal_evaluation(db_path, symbol="ADAUSDT", return_pct=-10.0)
+
+    code, out, err = _run(
+        "--project-root", str(cli_project),
+        "analytics", "summary", "--scope", "all", "--min-signals", "1",
+    )
+    assert code == 0, err
+    assert "Analytics — 4 sinais" in out
+    assert "Geral" in out
+    # WR should appear under Geral.
+    assert "Win rate: 50.0%" in out
+
+
+def test_analytics_summary_scope_filter(cli_project: Path) -> None:
+    """`--scope 30d` returns 0 rows when the seeded data is older."""
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+    db_path = cli_project / "data" / "crypto_monitor.db"
+    # Detected_at way in the past (2025-01-01) — well outside 30d.
+    _seed_signal_evaluation(
+        db_path, symbol="BTCUSDT",
+        detected_at="2025-01-01T12:00:00Z", return_pct=10.0,
+    )
+    code, out, _ = _run(
+        "--project-root", str(cli_project),
+        "analytics", "summary", "--scope", "30d",
+    )
+    assert code == 0, out
+    assert "Analytics — 0 sinais" in out
+
+
+# ---------- watchlist list ----------
+
+def test_watchlist_list_empty_message(cli_project: Path) -> None:
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+    code, out, _ = _run(
+        "--project-root", str(cli_project), "watchlist", "list"
+    )
+    assert code == 0
+    assert "(no active watchlist entries)" in out
+
+
+def test_watchlist_list_renders_active_entries(cli_project: Path) -> None:
+    _run("--project-root", str(cli_project), "init", "--no-seed")
+
+    # Seed an active watch directly via the store helper (Block 23 only
+    # ships the `list` subcommand — entries are produced by the
+    # scheduler, not by the CLI).
+    from datetime import datetime, timezone
+    from crypto_monitor.database.connection import get_connection
+    from crypto_monitor.database.migrations import run_migrations
+    from crypto_monitor.database.schema import init_db
+    from crypto_monitor.watchlist import upsert_watching
+    UTC = timezone.utc
+    conn = get_connection(cli_project / "data" / "crypto_monitor.db")
+    try:
+        init_db(conn)
+        run_migrations(conn)
+        upsert_watching(
+            conn, symbol="BTCUSDT", score=40,
+            now=datetime(2026, 4, 23, 15, 0, tzinfo=UTC),
+            max_watch_hours=48,
+        )
+    finally:
+        conn.close()
+
+    code, out, _ = _run(
+        "--project-root", str(cli_project), "watchlist", "list"
+    )
+    assert code == 0
+    assert "BTCUSDT" in out
+    assert "40" in out
+    assert "id" in out and "symbol" in out  # header present
+
+
 def test_main_returns_systemexit_on_unknown_command(tmp_path: Path) -> None:
     """argparse exits with code 2 when the subcommand is missing/unknown."""
     with pytest.raises(SystemExit) as info:
