@@ -97,8 +97,15 @@ def send_ntfy(
         http_post = _default_http_post()
 
     url = f"{ntfy.server_url.rstrip('/')}/{topic}"
+    # HTTP/1.1 header values are restricted to Latin-1 by ``requests`` /
+    # ``urllib3``. The weekly title carries an em-dash and the buy-side
+    # notification copy carries Portuguese accented characters and
+    # emoji — both unencodable as Latin-1 — so we wrap any non-ASCII
+    # header value in RFC 2047. ntfy decodes ``=?utf-8?B?...?=`` back
+    # to the original UTF-8 string server-side.
+    # See https://docs.ntfy.sh/publish/#message-headers.
     headers = {
-        "Title": title,
+        "Title": _encode_header_value(title),
         "Priority": priority,
     }
     # Merge default tags with per-call tags, preserving order and
@@ -109,7 +116,10 @@ def send_ntfy(
         if tag and tag not in merged_tags:
             merged_tags.append(tag)
     if merged_tags:
-        headers["Tags"] = ",".join(merged_tags)
+        # Tag values are conventionally ASCII (project tag names like
+        # "crypto_monitor", "weekly", "test"), but the encoder is a
+        # cheap no-op on ASCII so wrapping it is defensive and free.
+        headers["Tags"] = _encode_header_value(",".join(merged_tags))
 
     encoded_body = body.encode("utf-8")
 
@@ -199,3 +209,27 @@ def _default_http_post() -> HttpPost:
     import requests  # type: ignore[import-not-found]
 
     return requests.post
+
+
+def _encode_header_value(value: str) -> str:
+    """Return ``value`` safe to put in an HTTP/1.1 header.
+
+    HTTP headers default to Latin-1 in ``requests`` / ``urllib3``, so
+    a value like ``"Resumo semanal — 04/04 a 11/04"`` raises
+    ``UnicodeEncodeError`` at request time because the em-dash is
+    outside Latin-1. We wrap such values as RFC 2047 base64
+    (``=?utf-8?B?<base64>?=``) — ntfy explicitly supports this
+    encoding for the ``Title`` header and decodes it back to the
+    original UTF-8 string on the receiving phone.
+
+    Pure-ASCII values pass through unchanged (the common case for
+    ``priority``, project tags, and ``ntfy-test`` titles), so this
+    helper is a no-op for them.
+    """
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        import base64
+        b64 = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        return f"=?utf-8?B?{b64}?="
+    return value

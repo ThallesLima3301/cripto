@@ -259,36 +259,49 @@ def score_reversal_confirmation(
     rsi_recovery: bool,
     high_reclaim: bool,
     cap: int,
+    *,
+    divergence: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """Score candlestick pattern + RSI recovery + high reclaim (additive).
 
-    Sub-weights (Block 17, fixed):
-      * candlestick pattern detected   +5
-      * RSI recovered from oversold    +3
+    Sub-weights (Block 17 baseline, Block 27 added the optional
+    divergence component):
+
+      * candlestick pattern detected     +5
+      * RSI recovered from oversold      +3
       * latest close reclaims prior high +2
+      * bullish divergence (Block 27)    +2  (only set when the
+        feature flag is on at the call site; default ``False`` keeps
+        Block 17 behavior bit-for-bit)
 
     The sum is capped at ``cap`` (normally the factor budget from
-    ``ScoringWeights.reversal_pattern``, which is 10 by default and
-    equals the sum of the three sub-weights). The cap is kept as a
-    parameter so config changes cannot push this factor past the
-    reserved budget.
+    ``ScoringWeights.reversal_pattern``, which is 10 by default).
+    Adding the divergence sub-component does NOT grow the cap — when
+    every sub-signal fires the natural sum is 12 but the helper
+    returns ``min(..., cap)`` so the factor stays inside its budget.
 
     The detail dict always reports every sub-component so the breakdown
     remains explicit and testable even when a component scored zero.
+    The ``points_divergence`` and ``divergence`` keys are always
+    present (they read 0 / False when the caller didn't enable the
+    feature), keeping the row shape stable across config flips.
     """
     p_pattern = 5 if detected else 0
     p_rsi = 3 if rsi_recovery else 0
     p_high = 2 if high_reclaim else 0
-    total = min(p_pattern + p_rsi + p_high, cap)
+    p_div = 2 if divergence else 0
+    total = min(p_pattern + p_rsi + p_high + p_div, cap)
     return total, {
         "points": total,
         "points_pattern": p_pattern,
         "points_rsi_recovery": p_rsi,
         "points_high_reclaim": p_high,
+        "points_divergence": p_div,
         "detected": detected,
         "pattern": pattern_name,
         "rsi_recovery": rsi_recovery,
         "high_reclaim": high_reclaim,
+        "divergence": divergence,
     }
 
 

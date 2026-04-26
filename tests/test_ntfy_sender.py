@@ -198,3 +198,105 @@ def test_network_error_exhausts_retries(ntfy_settings):
     assert sleeps == [1.0, 2.0]
     assert result.error is not None
     assert "boom3" in result.error
+
+
+# ---------- RFC 2047 header encoding ----------
+
+def test_ascii_title_passes_through_unchanged(ntfy_settings):
+    """A pure-ASCII title is not wrapped — keeps backward compat for
+    every existing call site (ntfy-test, buy alerts with friendly
+    names like ``BTC``, the test fixtures elsewhere)."""
+    post = RecordingPost([FakeResponse(200)])
+    send_ntfy(
+        ntfy_settings,
+        "BTCUSDT STRONG 72",
+        "signal body",
+        http_post=post,
+        sleeper=_no_sleep,
+    )
+    assert post.calls[0]["headers"]["Title"] == "BTCUSDT STRONG 72"
+
+
+def test_non_ascii_title_is_rfc2047_encoded(ntfy_settings):
+    """The weekly title carries an em-dash (U+2014); accent-rich
+    Portuguese decision phrases on the buy side carry diacritics +
+    emoji. Both must transit as RFC-2047 base64 so ``requests``
+    accepts them and ntfy decodes them on the phone."""
+    import base64
+    post = RecordingPost([FakeResponse(200)])
+    title = "Resumo semanal — 04/04 a 11/04"
+    send_ntfy(
+        ntfy_settings, title, "body",
+        http_post=post, sleeper=_no_sleep,
+    )
+    sent_title = post.calls[0]["headers"]["Title"]
+    # Header is now ASCII-only (this would have raised UnicodeEncodeError
+    # under the old code path against a real HTTP layer).
+    sent_title.encode("ascii")
+    # Format: =?utf-8?B?<base64>?=
+    assert sent_title.startswith("=?utf-8?B?")
+    assert sent_title.endswith("?=")
+    encoded = sent_title.removeprefix("=?utf-8?B?").removesuffix("?=")
+    assert base64.b64decode(encoded).decode("utf-8") == title
+
+
+def test_emoji_title_is_rfc2047_encoded(ntfy_settings):
+    """The buy-side decision phrase ``🟡 Vale observar — BTC`` was the
+    other long-standing breakage. Pin it explicitly."""
+    post = RecordingPost([FakeResponse(200)])
+    title = "🟡 Vale observar — BTC"
+    send_ntfy(
+        ntfy_settings, title, "body",
+        http_post=post, sleeper=_no_sleep,
+    )
+    sent_title = post.calls[0]["headers"]["Title"]
+    sent_title.encode("ascii")
+    assert sent_title.startswith("=?utf-8?B?")
+
+
+def test_default_tags_with_unicode_are_encoded(ntfy_settings):
+    """Defensive: even though project tags are ASCII today, a future
+    user-configured tag with non-ASCII must not crash the sender."""
+    from dataclasses import replace
+    post = RecordingPost([FakeResponse(200)])
+    settings = replace(ntfy_settings, default_tags=("café",))
+    send_ntfy(
+        settings, "title", "body",
+        http_post=post, sleeper=_no_sleep,
+    )
+    sent_tags = post.calls[0]["headers"]["Tags"]
+    sent_tags.encode("ascii")
+    assert sent_tags.startswith("=?utf-8?B?")
+
+
+def test_weekly_send_succeeds_against_a_strict_ascii_http_layer(ntfy_settings):
+    """End-to-end shape of the bug: an http_post layer that mirrors
+    ``requests``/``urllib3`` (refusing non-ASCII headers) used to
+    surface the em-dash title as a network_error. With RFC 2047 in
+    place the same strict layer accepts the headers and returns 200."""
+
+    class StrictAsciiPost:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def __call__(self, url, *, data, headers, timeout):
+            for name, value in headers.items():
+                # Same check requests/urllib3 perform under the hood.
+                value.encode("latin-1")
+            self.calls.append({"url": url, "headers": dict(headers)})
+            return FakeResponse(200)
+
+    post = StrictAsciiPost()
+    result = send_ntfy(
+        ntfy_settings,
+        "Resumo semanal — 04/04 a 11/04",
+        "body",
+        priority="default",
+        tags=("weekly",),
+        http_post=post,
+        sleeper=_no_sleep,
+    )
+    assert result.sent is True
+    assert result.reason == REASON_SENT
+    # The Title was actually accepted by the strict layer.
+    assert "Title" in post.calls[0]["headers"]

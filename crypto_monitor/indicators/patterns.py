@@ -150,3 +150,72 @@ def detect_high_reclaim(
     window = candles[-(lookback + 1):-1]
     prior_high = max(c.high for c in window)
     return latest_close > prior_high
+
+
+def detect_bullish_divergence(
+    candles: list[Candle],
+    rsi_values: list[float | None],
+    *,
+    window: int = 14,
+) -> bool:
+    """Return True when price prints a lower low while RSI prints a higher low.
+
+    Block 27, optional refinement. Conservative pivot logic:
+
+      1. Look at the last ``window`` candles and the matching tail of
+         ``rsi_values``. Both inputs must be at least ``window`` long
+         and aligned by index.
+      2. Split that tail into an older half and a newer half (the
+         oldest item of the window is index 0).
+      3. Find the bar with the lowest ``close`` in each half.
+      4. Divergence fires when:
+            - ``close[newer_low] < close[older_low]``  (price = lower low),
+            - ``rsi[newer_low]   > rsi[older_low]``    (RSI   = higher low),
+            both inequalities strict so flat / equal data does not
+            register as a signal.
+
+    Returns ``False`` on insufficient history (``len(candles) < window``
+    or fewer aligned RSI values), ``window < 4`` (no two halves), or
+    when either pivot's RSI value is ``None``.
+
+    The detector is pure: no DB, no I/O. The caller (engine) computes
+    the RSI series via ``indicators.rsi.rsi_series`` and slices the
+    aligned tail.
+    """
+    if window < 4:
+        return False
+    n = len(candles)
+    if n < window or len(rsi_values) < window:
+        return False
+
+    closes_tail = [c.close for c in candles[-window:]]
+    rsi_tail = list(rsi_values[-window:])
+    half = window // 2
+
+    older_idx = _argmin_close(closes_tail[:half])
+    newer_idx_local = _argmin_close(closes_tail[half:])
+    if older_idx is None or newer_idx_local is None:
+        return False
+    newer_idx = half + newer_idx_local
+
+    rsi_older = rsi_tail[older_idx]
+    rsi_newer = rsi_tail[newer_idx]
+    if rsi_older is None or rsi_newer is None:
+        return False
+
+    price_lower_low = closes_tail[newer_idx] < closes_tail[older_idx]
+    rsi_higher_low = rsi_newer > rsi_older
+    return price_lower_low and rsi_higher_low
+
+
+def _argmin_close(values: list[float]) -> int | None:
+    """Return the index of the lowest value (earliest-tie wins), or None."""
+    if not values:
+        return None
+    best_i = 0
+    best_v = values[0]
+    for i in range(1, len(values)):
+        if values[i] < best_v:
+            best_v = values[i]
+            best_i = i
+    return best_i

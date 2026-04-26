@@ -49,7 +49,13 @@
       "Bash(python -m pytest tests/test_analytics_aggregator.py -q)",
       "Bash(python -m pytest tests/test_weekly_summary.py tests/test_cli.py tests/test_formatters.py -q)",
       "Bash(python -m pytest tests/test_analytics_reporter.py tests/test_cli.py tests/test_weekly_summary.py -q)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/test_divergence.py -q)",
+      "Bash(python -c \"import importlib.util; print\\('fastapi:', importlib.util.find_spec\\('fastapi'\\) is not None\\); print\\('pydantic:', importlib.util.find_spec\\('pydantic'\\) is not None\\); print\\('httpx:', importlib.util.find_spec\\('httpx'\\) is not None\\)\")",
+      "Bash(pip install *)",
+      "Bash(python -m pytest tests/test_dashboard_api.py -q)",
+      "Bash(python -m pytest tests/test_cli.py -q -k weekly)",
+      "Bash(python -m pytest tests/test_ntfy_sender.py -q)"
     ]
   }
 }

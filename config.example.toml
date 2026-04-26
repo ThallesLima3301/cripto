@@ -82,6 +82,13 @@ discount_30d_points  = [2, 5]
 discount_180d_levels = [20.0, 40.0]
 discount_180d_points = [2, 5]
 
+# Block 27 — bullish divergence as an additional reversal sub-component.
+# When true, a price-makes-lower-low + RSI-makes-higher-low pattern over
+# the recent 1h window adds +2 to the reversal_pattern factor (capped
+# at the factor budget so it never grows past the reserved 10 points).
+# Off by default — flip on once you want the extra sensitivity.
+divergence_enabled = false
+
 [scoring.severity]
 # Score thresholds for each severity tier.
 normal      = 50

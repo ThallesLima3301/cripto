@@ -92,6 +92,11 @@ class ScoringThresholds:
     discount_180d_levels: tuple[float, ...]
     discount_180d_points: tuple[int, ...]
 
+    # Block 27 — bullish divergence feature flag. Off by default so the
+    # reversal-confirmation factor reproduces Block 17 behavior unless
+    # the user explicitly opts in.
+    divergence_enabled: bool = False
+
 
 @dataclass(frozen=True)
 class ScoringSeverity:
@@ -330,6 +335,7 @@ def load_settings(project_root: Path) -> Settings:
         discount_30d_points=tuple(int(x) for x in st["discount_30d_points"]),
         discount_180d_levels=tuple(float(x) for x in st["discount_180d_levels"]),
         discount_180d_points=tuple(int(x) for x in st["discount_180d_points"]),
+        divergence_enabled=bool(st.get("divergence_enabled", False)),
     )
 
     sv = _require(raw, "scoring", "severity")

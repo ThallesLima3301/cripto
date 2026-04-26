@@ -118,6 +118,44 @@ def insert_sell_signal(
     return int(cur.lastrowid)
 
 
+def count_sell_signals_since(
+    conn: sqlite3.Connection,
+    *,
+    since_iso: str,
+) -> int:
+    """Return the count of ``sell_signals`` with ``detected_at >= since_iso``.
+
+    Mirrors :func:`crypto_monitor.signals.persistence.count_signals_since`
+    so the dashboard overview can render parallel KPI cards for buy
+    and sell activity without each route writing its own SQL.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM sell_signals WHERE detected_at >= ?",
+        (since_iso,),
+    ).fetchone()
+    return int(row["cnt"]) if row is not None else 0
+
+
+def list_recent_sell_signals(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 10,
+) -> list[sqlite3.Row]:
+    """Return the most recent ``sell_signals`` rows for the activity feed."""
+    if limit <= 0:
+        return []
+    return conn.execute(
+        """
+        SELECT id, symbol, buy_id, rule_triggered, severity,
+               detected_at, price_at_signal, pnl_pct
+        FROM sell_signals
+        ORDER BY detected_at DESC, id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+
+
 def last_sell_signal_time(
     conn: sqlite3.Connection,
     *,

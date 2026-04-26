@@ -18,6 +18,14 @@ dependencies = [
 dev = [
     "pytest>=8,<10",
 ]
+# Read-only dashboard API. Optional because the bot itself never
+# imports anything from `crypto_monitor.dashboard`; only the operator
+# who wants to serve the FastAPI adapter needs these.
+dashboard = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "pydantic>=2.6,<3",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

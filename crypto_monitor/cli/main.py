@@ -362,14 +362,73 @@ def _cmd_scan(args: argparse.Namespace, ctx: _Context) -> int:
 
 
 def _cmd_weekly(args: argparse.Namespace, ctx: _Context) -> int:
+    """Generate the weekly summary, persist it, and try to dispatch via ntfy.
+
+    Exit code policy
+    ----------------
+    The summary's persistence and its notification delivery are
+    independent concerns:
+
+      * Generation + persistence   — the actual work. Failure here
+                                     should fail the command.
+      * ntfy delivery              — best-effort. The persisted row
+                                     keeps ``sent=0`` so a future
+                                     ``weekly`` run (or a retry
+                                     workflow) can pick it up.
+
+    Returning exit 1 on every send failure conflates these and causes
+    the GitHub Actions ``weekly`` workflow to abort before its
+    ``Push state`` step, which would discard the perfectly good
+    summary row from the encrypted state branch. Instead we exit 0
+    whenever the row was persisted (mirrors ``_cmd_scan`` /
+    ``_cmd_evaluate``), surface the send outcome on stdout, and
+    emit a one-line warning to stderr so operators still notice
+    real delivery failures.
+    """
     run = run_weekly(project_root=ctx.project_root)
+
+    send_label = _format_weekly_send_label(run.send_result)
     ctx.out(
         f"weekly summary id={run.summary_id} "
         f"signals={run.summary.signal_count} "
         f"buys={run.summary.buy_count} "
-        f"sent={'yes' if run.send_result.sent else 'no'}"
+        f"sent={send_label}"
     )
-    return 0 if run.send_result.sent else 1
+
+    # Real delivery failures (network / HTTP) are noteworthy even
+    # though they don't fail the command. A missing topic is a
+    # configuration state and not warned about — the user already
+    # knows their ntfy isn't wired up.
+    if not run.send_result.sent and run.send_result.reason not in (
+        "missing_topic", "sent",
+    ):
+        ctx.err(
+            f"warning: weekly notification not delivered "
+            f"(reason={run.send_result.reason}, "
+            f"status={run.send_result.status_code}, "
+            f"error={run.send_result.error}); "
+            f"row id={run.summary_id} kept with sent=0 for retry"
+        )
+
+    # Persisted ⇒ success, regardless of delivery. ``run_weekly``
+    # always returns a summary_id > 0 once the row is in the DB.
+    return 0 if run.summary_id > 0 else 1
+
+
+def _format_weekly_send_label(result) -> str:
+    """Render the send outcome for the ``weekly`` CLI output line.
+
+    Distinguishes the three outcomes operators care about:
+
+      * ``ok``                 — ntfy 2xx
+      * ``skipped(missing_topic)`` — ``NTFY_TOPIC`` not set in the env
+      * ``failed(<reason>)``   — anything else (network, 4xx, 5xx)
+    """
+    if result.sent:
+        return "ok"
+    if result.reason == "missing_topic":
+        return "skipped(missing_topic)"
+    return f"failed({result.reason})"
 
 
 def _cmd_evaluate(args: argparse.Namespace, ctx: _Context) -> int:

@@ -71,6 +71,75 @@ class InsertResult:
     reason: str
 
 
+# ---------- read-only helpers (used by the dashboard API) ----------
+
+def count_signals_since(
+    conn: sqlite3.Connection,
+    *,
+    since_iso: str,
+) -> int:
+    """Return the number of rows in ``signals`` with ``detected_at >= since_iso``.
+
+    Used by the dashboard ``/api/overview`` endpoint to populate the
+    "signals in last 24h / 7d" KPI cards. Kept as a small, focused
+    reader in this module so the API never embeds raw SQL.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM signals WHERE detected_at >= ?",
+        (since_iso,),
+    ).fetchone()
+    return int(row["cnt"]) if row is not None else 0
+
+
+def latest_candle_close_time(
+    conn: sqlite3.Connection,
+    *,
+    interval: str = "1h",
+) -> str | None:
+    """Return the ``close_time`` of the most recent candle for ``interval``.
+
+    Used by the dashboard health probe as a freshness indicator —
+    "how stale is the data the API is serving". ``None`` when there
+    are no candles yet for that interval.
+    """
+    row = conn.execute(
+        """
+        SELECT close_time FROM candles
+        WHERE interval = ?
+        ORDER BY open_time DESC
+        LIMIT 1
+        """,
+        (interval,),
+    ).fetchone()
+    return str(row["close_time"]) if row is not None else None
+
+
+def list_recent_signals(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 10,
+) -> list[sqlite3.Row]:
+    """Return the most recent ``signals`` rows for the activity feed.
+
+    Returns ``sqlite3.Row`` objects so callers can pick the columns
+    they care about without the helper having to know about every
+    consumer's display shape. Newest first; ties broken by id DESC for
+    determinism.
+    """
+    if limit <= 0:
+        return []
+    return conn.execute(
+        """
+        SELECT id, symbol, severity, score, detected_at,
+               trigger_reason
+        FROM signals
+        ORDER BY detected_at DESC, id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+
+
 # ---------- candle loading ----------
 
 def load_candles(

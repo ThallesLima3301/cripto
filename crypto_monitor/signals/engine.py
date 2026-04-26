@@ -27,12 +27,14 @@ from crypto_monitor.config.settings import ScoringSettings
 from crypto_monitor.indicators import (
     Candle,
     atr,
+    detect_bullish_divergence,
     detect_high_reclaim,
     detect_reversal,
     detect_rsi_recovery,
     find_heuristic_support,
     relative_volume,
     rsi,
+    rsi_series,
     trend_label,
 )
 from crypto_monitor.signals.factors import (
@@ -99,6 +101,16 @@ def score_signal(
     reversal = detect_reversal(candles_1h)
     rsi_recovery = detect_rsi_recovery(closes_1h, period=14)
     high_reclaim = detect_high_reclaim(candles_1h)
+    # Block 27 — bullish divergence sub-signal, gated by config so the
+    # default behavior is identical to Block 17.
+    if scoring.thresholds.divergence_enabled:
+        divergence = detect_bullish_divergence(
+            candles_1h,
+            rsi_series(closes_1h, period=14),
+            window=14,
+        )
+    else:
+        divergence = False
     trend_4h = trend_label(closes_4h)
     trend_1d = trend_label(closes_1d)
 
@@ -135,6 +147,7 @@ def score_signal(
         rsi_recovery,
         high_reclaim,
         w.reversal_pattern,
+        divergence=divergence,
     )
     trend_pts, trend_detail = score_trend_context(
         trend_1d, w.trend_context

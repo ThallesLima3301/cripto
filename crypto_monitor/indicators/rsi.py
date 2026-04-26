@@ -49,3 +49,48 @@ def rsi(closes: list[float], period: int = 14) -> float | None:
 
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
+
+
+def rsi_series(closes: list[float], period: int = 14) -> list[float | None]:
+    """Return the per-bar RSI series aligned with ``closes``.
+
+    The first ``period`` entries (the warmup band) are ``None``; from
+    index ``period`` onward each entry is the Wilder RSI computed over
+    the trailing ``period`` deltas. Used by the bullish-divergence
+    detector (Block 27) which needs RSI **at specific candle indices**,
+    not just the latest scalar.
+
+    Edge cases mirror :func:`rsi`: a fully flat trailing window
+    yields 50.0; all-up yields 100.0; all-down yields 0.0.
+    """
+    n = len(closes)
+    out: list[float | None] = [None] * n
+    if period < 2 or n < period + 1:
+        return out
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, n)]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    out[period] = _rsi_from_avgs(avg_gain, avg_loss)
+
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        out[i + 1] = _rsi_from_avgs(avg_gain, avg_loss)
+
+    return out
+
+
+def _rsi_from_avgs(avg_gain: float, avg_loss: float) -> float:
+    if avg_gain == 0 and avg_loss == 0:
+        return 50.0
+    if avg_loss == 0:
+        return 100.0
+    if avg_gain == 0:
+        return 0.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))

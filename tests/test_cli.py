@@ -346,21 +346,40 @@ def test_cmd_scan_returns_nonzero_when_report_has_errors(
     assert code == 1
 
 
-def test_cmd_weekly_prints_summary_and_handles_send_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    summary = WeeklySummary(
+def _weekly_summary_fixture(
+    *,
+    signal_count: int = 4,
+    buy_count: int = 1,
+    top_drop_symbol: str | None = "BTCUSDT",
+    top_drop_pct: float | None = -7.5,
+) -> WeeklySummary:
+    """Build a WeeklySummary with sensible defaults for CLI tests."""
+    return WeeklySummary(
         week_start="2026-04-04T00:00:00Z",
         week_end="2026-04-11T00:00:00Z",
-        signal_count=4,
-        signal_by_severity={"strong": 2, "normal": 2},
-        buy_count=1,
-        top_drop_symbol="BTCUSDT",
-        top_drop_pct=-7.5,
+        signal_count=signal_count,
+        signal_by_severity={"strong": 2, "normal": 2}
+        if signal_count else {},
+        buy_count=buy_count,
+        top_drop_symbol=top_drop_symbol,
+        top_drop_pct=top_drop_pct,
         matured_count=0,
         verdict_counts={},
         body="weekly body",
     )
+
+
+def test_cmd_weekly_send_skipped_for_missing_topic_still_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A summary persisted but not sent (no topic) is success, not failure.
+
+    The summary row already lives in `weekly_summaries` with `sent=0`;
+    a future weekly run can retry the dispatch by id. Failing the
+    command here would also abort the GHA `Push state` step and
+    discard the row entirely.
+    """
+    summary = _weekly_summary_fixture()
     sent_result = SendResult(sent=False, reason="missing_topic")
 
     def fake_run_weekly(**_: Any) -> WeeklyRunResult:
@@ -370,28 +389,55 @@ def test_cmd_weekly_prints_summary_and_handles_send_failure(
 
     monkeypatch.setattr(CLI_MODULE, "run_weekly", fake_run_weekly)
 
-    code, out, _ = _run("--project-root", str(tmp_path), "weekly")
-    assert code == 1  # send failed
+    code, out, err = _run("--project-root", str(tmp_path), "weekly")
+    assert code == 0  # persisted -> success regardless of delivery
     assert "id=42" in out
     assert "signals=4" in out
     assert "buys=1" in out
-    assert "sent=no" in out
+    assert "sent=skipped(missing_topic)" in out
+    # Missing topic is a config state, not a transient failure —
+    # the operator already knows ntfy isn't wired up, so we don't
+    # spam stderr about it.
+    assert err == ""
+
+
+def test_cmd_weekly_send_failure_warns_to_stderr_but_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Real ntfy failures (network / 5xx) emit a stderr warning but
+    keep the exit code at 0 so the workflow's later steps still run."""
+    summary = _weekly_summary_fixture()
+    sent_result = SendResult(
+        sent=False,
+        reason="network_error",
+        status_code=None,
+        error="ConnectionResetError: peer closed",
+    )
+
+    monkeypatch.setattr(
+        CLI_MODULE,
+        "run_weekly",
+        lambda **_: WeeklyRunResult(
+            summary=summary, summary_id=42, send_result=sent_result
+        ),
+    )
+
+    code, out, err = _run("--project-root", str(tmp_path), "weekly")
+    assert code == 0
+    assert "sent=failed(network_error)" in out
+    # Warning surfaces the reason + that the row is preserved.
+    assert "warning" in err.lower()
+    assert "network_error" in err
+    assert "id=42" in err
+    assert "sent=0 for retry" in err
 
 
 def test_cmd_weekly_success_returns_zero(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    summary = WeeklySummary(
-        week_start="2026-04-04T00:00:00Z",
-        week_end="2026-04-11T00:00:00Z",
-        signal_count=0,
-        signal_by_severity={},
-        buy_count=0,
-        top_drop_symbol=None,
-        top_drop_pct=None,
-        matured_count=0,
-        verdict_counts={},
-        body="quiet week",
+    summary = _weekly_summary_fixture(
+        signal_count=0, buy_count=0,
+        top_drop_symbol=None, top_drop_pct=None,
     )
     ok = SendResult(sent=True, reason=REASON_SENT, status_code=200)
 
@@ -403,9 +449,10 @@ def test_cmd_weekly_success_returns_zero(
         ),
     )
 
-    code, out, _ = _run("--project-root", str(tmp_path), "weekly")
+    code, out, err = _run("--project-root", str(tmp_path), "weekly")
     assert code == 0
-    assert "sent=yes" in out
+    assert "sent=ok" in out
+    assert err == ""
 
 
 def test_cmd_evaluate_dispatches_and_prints_summary(
