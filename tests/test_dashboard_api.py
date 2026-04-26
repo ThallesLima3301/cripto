@@ -19,14 +19,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from crypto_monitor.dashboard import api as dashboard_api
-from crypto_monitor.dashboard.api import app
-from crypto_monitor.dashboard.deps import get_db
-from crypto_monitor.database.connection import get_connection
-from crypto_monitor.database.migrations import run_migrations
-from crypto_monitor.database.schema import init_db
+# The dashboard layer is an optional extra (`pip install ".[dashboard]"`).
+# When fastapi/pydantic aren't installed — for example in the scheduled
+# `scan` GHA workflow, which only installs `requirements.txt` for the
+# bot's runtime dependencies — pytest must SKIP this entire module
+# instead of failing collection. Locally (and in any CI that installs
+# the extra), all 12 tests run normally.
+pytest.importorskip("fastapi")
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from crypto_monitor.dashboard import api as dashboard_api  # noqa: E402
+from crypto_monitor.dashboard.api import app  # noqa: E402
+from crypto_monitor.dashboard.deps import get_db  # noqa: E402
+from crypto_monitor.database.connection import get_connection  # noqa: E402
+from crypto_monitor.database.migrations import run_migrations  # noqa: E402
+from crypto_monitor.database.schema import init_db  # noqa: E402
 
 
 UTC = timezone.utc
