@@ -55,7 +55,14 @@
       "Bash(pip install *)",
       "Bash(python -m pytest tests/test_dashboard_api.py -q)",
       "Bash(python -m pytest tests/test_cli.py -q -k weekly)",
-      "Bash(python -m pytest tests/test_ntfy_sender.py -q)"
+      "Bash(python -m pytest tests/test_ntfy_sender.py -q)",
+      "Bash(python -m pytest tests/test_dashboard_api.py -q -p no:cacheprovider --override-ini=\"addopts=\" -W error::ImportWarning -p disabled_modules)",
+      "Bash(python -m pytest tests/test_manual_buys.py tests/test_buy_evaluation.py tests/test_sell_store.py -q)",
+      "Bash(npm install *)",
+      "Bash(npm view *)",
+      "Bash(python -c \"import sys, json; v=json.load\\(sys.stdin\\); print\\('\\\\n'.join\\([x for x in v if x.startswith\\('14.2.'\\)][-10:]\\)\\)\")",
+      "Bash(npm run *)",
+      "PowerShell(Get-Process node -ErrorAction SilentlyContinue)"
     ]
   }
 }

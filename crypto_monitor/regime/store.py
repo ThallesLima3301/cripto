@@ -55,3 +55,40 @@ def load_latest_regime(
         atr_percentile=row["atr_percentile"],
         determined_at=row["determined_at"],
     )
+
+
+def list_regime_history(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+) -> list[RegimeSnapshot]:
+    """Return recent regime snapshots, newest first.
+
+    Used by the dashboard ``/api/regime/history`` endpoint to render
+    the regime timeline. Bounded by ``limit`` so the response stays
+    small even after months of scans (the table grows by one row per
+    scan when the feature is enabled).
+    """
+    if limit <= 0:
+        return []
+    rows = conn.execute(
+        """
+        SELECT label, btc_ema_short, btc_ema_long, btc_atr_14d,
+               atr_percentile, determined_at
+        FROM regime_snapshots
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    return [
+        RegimeSnapshot(
+            label=r["label"],
+            btc_ema_short=r["btc_ema_short"],
+            btc_ema_long=r["btc_ema_long"],
+            btc_atr_14d=r["btc_atr_14d"],
+            atr_percentile=r["atr_percentile"],
+            determined_at=r["determined_at"],
+        )
+        for r in rows
+    ]

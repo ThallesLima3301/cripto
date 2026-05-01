@@ -14,6 +14,7 @@ is well outside Phase 1 scope.
 
 from crypto_monitor.buys.manual import (
     BuyRecord,
+    count_buys,
     get_buy,
     insert_buy,
     list_buys,
@@ -21,6 +22,7 @@ from crypto_monitor.buys.manual import (
 
 __all__ = [
     "BuyRecord",
+    "count_buys",
     "insert_buy",
     "get_buy",
     "list_buys",

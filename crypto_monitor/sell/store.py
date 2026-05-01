@@ -156,6 +156,87 @@ def list_recent_sell_signals(
     ).fetchall()
 
 
+_SELL_SIGNAL_LIST_COLS = (
+    "id, symbol, buy_id, rule_triggered, severity, "
+    "detected_at, price_at_signal, pnl_pct, "
+    "regime_at_signal, reason, alerted"
+)
+
+
+def list_sell_signals(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str | None = None,
+    rule: str | None = None,
+    since_iso: str | None = None,
+    until_iso: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
+    """Filter + paginate ``sell_signals`` for the dashboard.
+
+    Mirrors :func:`crypto_monitor.signals.persistence.list_signals` so
+    the API's pagination handling stays uniform across signal types.
+    """
+    clauses, params = _sell_filter_clauses(
+        symbol=symbol, rule=rule,
+        since_iso=since_iso, until_iso=until_iso,
+    )
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = (
+        f"SELECT {_SELL_SIGNAL_LIST_COLS} FROM sell_signals {where} "
+        "ORDER BY detected_at DESC, id DESC "
+        "LIMIT ? OFFSET ?"
+    )
+    params.extend([max(1, int(limit)), max(0, int(offset))])
+    return conn.execute(sql, tuple(params)).fetchall()
+
+
+def count_sell_signals(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str | None = None,
+    rule: str | None = None,
+    since_iso: str | None = None,
+    until_iso: str | None = None,
+) -> int:
+    """Count rows matching the same filters as :func:`list_sell_signals`."""
+    clauses, params = _sell_filter_clauses(
+        symbol=symbol, rule=rule,
+        since_iso=since_iso, until_iso=until_iso,
+    )
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    row = conn.execute(
+        f"SELECT COUNT(*) AS cnt FROM sell_signals {where}",
+        tuple(params),
+    ).fetchone()
+    return int(row["cnt"]) if row is not None else 0
+
+
+def _sell_filter_clauses(
+    *,
+    symbol: str | None,
+    rule: str | None,
+    since_iso: str | None,
+    until_iso: str | None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if symbol is not None:
+        clauses.append("symbol = ?")
+        params.append(symbol)
+    if rule is not None:
+        clauses.append("rule_triggered = ?")
+        params.append(rule)
+    if since_iso is not None:
+        clauses.append("detected_at >= ?")
+        params.append(since_iso)
+    if until_iso is not None:
+        clauses.append("detected_at < ?")
+        params.append(until_iso)
+    return clauses, params
+
+
 def last_sell_signal_time(
     conn: sqlite3.Connection,
     *,

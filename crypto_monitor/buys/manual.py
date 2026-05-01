@@ -37,6 +37,10 @@ class BuyRecord:
     Mirrors the schema 1:1 apart from ordering. `quantity` is
     derived at insert time from `amount_invested / price` so
     downstream consumers never need to re-derive it.
+
+    The ``sold_*`` columns (added by migration 003 in Block 19) are
+    surfaced here too. They are ``None`` for open buys; ``record_sale``
+    populates them when the user marks a buy as closed.
     """
     id: int
     symbol: str
@@ -48,6 +52,9 @@ class BuyRecord:
     signal_id: int | None
     note: str | None
     created_at: str           # UTC ISO
+    sold_at: str | None = None
+    sold_price: float | None = None
+    sold_note: str | None = None
 
 
 def insert_buy(
@@ -160,30 +167,84 @@ def get_buy(conn: sqlite3.Connection, buy_id: int) -> BuyRecord | None:
 
 
 def list_buys(
-    conn: sqlite3.Connection, *, symbol: str | None = None
+    conn: sqlite3.Connection,
+    *,
+    symbol: str | None = None,
+    status: str = "all",
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[BuyRecord]:
-    """Return buys in chronological order, optionally filtered by symbol."""
-    if symbol is None:
-        rows = conn.execute(
-            """
-            SELECT id, symbol, bought_at, price, amount_invested,
-                   quote_currency, quantity, signal_id, note, created_at
-            FROM buys
-            ORDER BY bought_at ASC, id ASC
-            """
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT id, symbol, bought_at, price, amount_invested,
-                   quote_currency, quantity, signal_id, note, created_at
-            FROM buys
-            WHERE symbol = ?
-            ORDER BY bought_at ASC, id ASC
-            """,
-            (symbol,),
-        ).fetchall()
+    """Return buys in chronological order with optional filters.
+
+    Parameters
+    ----------
+    symbol
+        Restrict to one Binance pair when provided.
+    status
+        ``"all"``  — every row (default; matches pre-Block-23 behavior).
+        ``"open"`` — only rows where ``sold_at IS NULL``.
+        ``"sold"`` — only rows where ``sold_at IS NOT NULL``.
+    limit, offset
+        Optional pagination. ``limit=None`` returns every match (matches
+        pre-Block-23 behavior). ``limit > 0`` enables the LIMIT/OFFSET
+        clause in the query.
+    """
+    if status not in ("all", "open", "sold"):
+        raise ValueError(f"unsupported status: {status!r}")
+
+    clauses, params = _buys_filter_clauses(symbol=symbol, status=status)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = (
+        "SELECT id, symbol, bought_at, price, amount_invested, "
+        "       quote_currency, quantity, signal_id, note, created_at, "
+        "       sold_at, sold_price, sold_note "
+        f"FROM buys {where} "
+        "ORDER BY bought_at ASC, id ASC"
+    )
+    if limit is not None and limit > 0:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([int(limit), max(0, int(offset))])
+    rows = conn.execute(sql, tuple(params)).fetchall()
     return [_row_to_record(r) for r in rows]
+
+
+def count_buys(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str | None = None,
+    status: str = "all",
+) -> int:
+    """Count buys matching the same filters as :func:`list_buys`.
+
+    Used by the dashboard ``/api/buys`` endpoint to populate
+    pagination metadata without a second SELECT.
+    """
+    if status not in ("all", "open", "sold"):
+        raise ValueError(f"unsupported status: {status!r}")
+    clauses, params = _buys_filter_clauses(symbol=symbol, status=status)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    row = conn.execute(
+        f"SELECT COUNT(*) AS cnt FROM buys {where}",
+        tuple(params),
+    ).fetchone()
+    return int(row["cnt"]) if row is not None else 0
+
+
+def _buys_filter_clauses(
+    *,
+    symbol: str | None,
+    status: str,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if symbol is not None:
+        clauses.append("symbol = ?")
+        params.append(symbol)
+    if status == "open":
+        clauses.append("sold_at IS NULL")
+    elif status == "sold":
+        clauses.append("sold_at IS NOT NULL")
+    return clauses, params
 
 
 # ---------- internals ----------
@@ -196,6 +257,10 @@ def _signal_exists(conn: sqlite3.Connection, signal_id: int) -> bool:
 
 
 def _row_to_record(row: sqlite3.Row) -> BuyRecord:
+    # Defensive lookup for the Block-19 sold_* columns: callers reading
+    # rows from a SELECT that does not project them (e.g. ``get_buy``)
+    # still get a valid BuyRecord with ``None`` sold_*.
+    keys = row.keys() if hasattr(row, "keys") else ()
     return BuyRecord(
         id=int(row["id"]),
         symbol=row["symbol"],
@@ -207,4 +272,11 @@ def _row_to_record(row: sqlite3.Row) -> BuyRecord:
         signal_id=(int(row["signal_id"]) if row["signal_id"] is not None else None),
         note=row["note"],
         created_at=row["created_at"],
+        sold_at=row["sold_at"] if "sold_at" in keys else None,
+        sold_price=(
+            float(row["sold_price"])
+            if "sold_price" in keys and row["sold_price"] is not None
+            else None
+        ),
+        sold_note=row["sold_note"] if "sold_note" in keys else None,
     )

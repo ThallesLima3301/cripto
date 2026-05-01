@@ -360,6 +360,33 @@ def _count_buys(
     return int(row["cnt"]) if row is not None else 0
 
 
+def list_weekly_summaries(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 20,
+) -> list[sqlite3.Row]:
+    """Return recent ``weekly_summaries`` rows for the dashboard.
+
+    Newest first by ``week_end``, then ``id`` DESC for deterministic
+    ties. Includes the structured fields the dashboard renders without
+    re-running the queries (signal/buy counts, top drop, sent flag) plus
+    the rendered ``body`` so the UI can show the canonical text.
+    """
+    if limit <= 0:
+        return []
+    return conn.execute(
+        """
+        SELECT id, week_start, week_end, generated_at, body,
+               signal_count, buy_count,
+               top_drop_symbol, top_drop_pct, sent
+        FROM weekly_summaries
+        ORDER BY week_end DESC, id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+
+
 def _build_analytics_section(
     conn: sqlite3.Connection,
     now: datetime,

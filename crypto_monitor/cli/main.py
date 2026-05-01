@@ -455,6 +455,7 @@ def _cmd_buy_add(args: argparse.Namespace, ctx: _Context) -> int:
     conn = get_connection(settings.general.db_path)
     try:
         init_db(conn)
+        run_migrations(conn)  # buys.sold_* (mig 003) reads/writes need this
         record = insert_buy(
             conn,
             symbol=args.symbol,
@@ -482,6 +483,7 @@ def _cmd_buy_list(args: argparse.Namespace, ctx: _Context) -> int:
     conn = get_connection(settings.general.db_path)
     try:
         init_db(conn)
+        run_migrations(conn)  # list_buys projects sold_* (migration 003)
         records = list_buys(conn, symbol=args.symbol)
     finally:
         conn.close()

@@ -140,6 +140,194 @@ def list_recent_signals(
     ).fetchall()
 
 
+# Columns surfaced on every dashboard signals list / detail row.
+# Kept as a constant so ``list_signals`` and ``get_signal_detail``
+# stay byte-identical in the columns they project.
+_SIGNAL_LIST_COLS = (
+    "id, symbol, detected_at, candle_hour, price_at_signal, "
+    "score, severity, trigger_reason, "
+    "dominant_trigger_timeframe, drop_trigger_pct, "
+    "rsi_1h, rsi_4h, rel_volume, "
+    "regime_at_signal, watchlist_id"
+)
+
+
+def list_signals(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str | None = None,
+    severity: str | None = None,
+    regime: str | None = None,
+    since_iso: str | None = None,
+    until_iso: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
+    """Filter + paginate the ``signals`` table for the dashboard.
+
+    All filters are AND'd. ``since_iso`` is ``detected_at >= ?``;
+    ``until_iso`` is ``detected_at < ?`` (half-open) so a window
+    ``[from, to)`` doesn't double-count the boundary tick.
+
+    Newest first by ``detected_at`` with ``id`` as the tie-breaker
+    so paginated reads are deterministic across cycles.
+    """
+    clauses, params = _signal_filter_clauses(
+        symbol=symbol, severity=severity, regime=regime,
+        since_iso=since_iso, until_iso=until_iso,
+    )
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = (
+        f"SELECT {_SIGNAL_LIST_COLS} FROM signals {where} "
+        "ORDER BY detected_at DESC, id DESC "
+        "LIMIT ? OFFSET ?"
+    )
+    params.extend([max(1, int(limit)), max(0, int(offset))])
+    return conn.execute(sql, tuple(params)).fetchall()
+
+
+def count_signals(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str | None = None,
+    severity: str | None = None,
+    regime: str | None = None,
+    since_iso: str | None = None,
+    until_iso: str | None = None,
+) -> int:
+    """Count signals matching the same filters as :func:`list_signals`."""
+    clauses, params = _signal_filter_clauses(
+        symbol=symbol, severity=severity, regime=regime,
+        since_iso=since_iso, until_iso=until_iso,
+    )
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    row = conn.execute(
+        f"SELECT COUNT(*) AS cnt FROM signals {where}",
+        tuple(params),
+    ).fetchone()
+    return int(row["cnt"]) if row is not None else 0
+
+
+def get_signal_detail(
+    conn: sqlite3.Connection,
+    signal_id: int,
+) -> sqlite3.Row | None:
+    """Return one signal joined with its evaluation row, or ``None``.
+
+    The evaluation columns come from a ``LEFT JOIN`` so signals that
+    haven't matured yet still return a row — the evaluation fields are
+    simply ``None``. The dashboard's signal-detail page uses this
+    single query instead of two round trips.
+
+    Includes the full ``score_breakdown`` JSON column so the
+    frontend can render the per-factor breakdown without a second
+    fetch. Every column is qualified with its table alias because
+    ``signal_evaluations`` shares names like ``id``/``signal_id``
+    with ``signals`` — leaving them unqualified would raise
+    ``ambiguous column`` at query time.
+    """
+    return conn.execute(
+        """
+        SELECT
+            s.id                           AS id,
+            s.symbol                       AS symbol,
+            s.detected_at                  AS detected_at,
+            s.candle_hour                  AS candle_hour,
+            s.price_at_signal              AS price_at_signal,
+            s.score                        AS score,
+            s.severity                     AS severity,
+            s.trigger_reason               AS trigger_reason,
+            s.dominant_trigger_timeframe   AS dominant_trigger_timeframe,
+            s.drop_trigger_pct             AS drop_trigger_pct,
+            s.rsi_1h                       AS rsi_1h,
+            s.rsi_4h                       AS rsi_4h,
+            s.rel_volume                   AS rel_volume,
+            s.regime_at_signal             AS regime_at_signal,
+            s.watchlist_id                 AS watchlist_id,
+            s.drop_24h_pct                 AS drop_24h_pct,
+            s.drop_7d_pct                  AS drop_7d_pct,
+            s.drop_30d_pct                 AS drop_30d_pct,
+            s.drop_180d_pct                AS drop_180d_pct,
+            s.distance_from_30d_high_pct   AS distance_from_30d_high_pct,
+            s.distance_from_180d_high_pct  AS distance_from_180d_high_pct,
+            s.dist_support_pct             AS dist_support_pct,
+            s.support_level_price          AS support_level_price,
+            s.reversal_signal              AS reversal_signal,
+            s.trend_context_4h             AS trend_context_4h,
+            s.trend_context_1d             AS trend_context_1d,
+            s.score_breakdown              AS score_breakdown,
+            e.evaluated_at                 AS eval_evaluated_at,
+            e.return_24h_pct               AS eval_return_24h_pct,
+            e.return_7d_pct                AS eval_return_7d_pct,
+            e.return_30d_pct               AS eval_return_30d_pct,
+            e.max_gain_7d_pct              AS eval_max_gain_7d_pct,
+            e.max_loss_7d_pct              AS eval_max_loss_7d_pct,
+            e.time_to_mfe_hours            AS eval_time_to_mfe_hours,
+            e.time_to_mae_hours            AS eval_time_to_mae_hours,
+            e.verdict                      AS eval_verdict
+        FROM signals s
+        LEFT JOIN signal_evaluations e ON e.signal_id = s.id
+        WHERE s.id = ?
+        """,
+        (int(signal_id),),
+    ).fetchone()
+
+
+def latest_close_for_symbol(
+    conn: sqlite3.Connection,
+    symbol: str,
+    *,
+    interval: str = "1h",
+) -> tuple[float, str] | None:
+    """Return ``(close, close_time)`` for the latest candle, or ``None``.
+
+    Used by the dashboard ``/api/open-buys`` endpoint as a freshness-
+    aware "current price" approximation. ntfy / scheduler code already
+    uses the same idiom internally; lifting it to the persistence
+    layer means the API never embeds the SQL.
+    """
+    row = conn.execute(
+        """
+        SELECT close, close_time FROM candles
+        WHERE symbol = ? AND interval = ?
+        ORDER BY open_time DESC
+        LIMIT 1
+        """,
+        (symbol, interval),
+    ).fetchone()
+    if row is None:
+        return None
+    return (float(row["close"]), str(row["close_time"]))
+
+
+def _signal_filter_clauses(
+    *,
+    symbol: str | None,
+    severity: str | None,
+    regime: str | None,
+    since_iso: str | None,
+    until_iso: str | None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if symbol is not None:
+        clauses.append("symbol = ?")
+        params.append(symbol)
+    if severity is not None:
+        clauses.append("severity = ?")
+        params.append(severity)
+    if regime is not None:
+        clauses.append("regime_at_signal = ?")
+        params.append(regime)
+    if since_iso is not None:
+        clauses.append("detected_at >= ?")
+        params.append(since_iso)
+    if until_iso is not None:
+        clauses.append("detected_at < ?")
+        params.append(until_iso)
+    return clauses, params
+
+
 # ---------- candle loading ----------
 
 def load_candles(

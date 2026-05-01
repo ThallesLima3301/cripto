@@ -376,3 +376,499 @@ class TestOpenApiSurface:
         # fetch wrapper relies on this.
         assert "data" in body
         assert "meta" in body
+
+
+# =====================================================================
+# Step 2 — list / detail endpoints
+# =====================================================================
+
+def _seed_signal_evaluation(
+    conn,
+    *,
+    signal_id: int,
+    return_7d_pct: float = 5.0,
+    verdict: str = "good",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO signal_evaluations (
+            signal_id, evaluated_at, price_at_signal,
+            return_7d_pct, max_gain_7d_pct, max_loss_7d_pct,
+            time_to_mfe_hours, time_to_mae_hours, verdict
+        ) VALUES (?, '2026-04-25T15:00:00Z', 100.0, ?, ?, ?, 24.0, 48.0, ?)
+        """,
+        (signal_id, return_7d_pct, return_7d_pct + 5.0,
+         return_7d_pct - 5.0, verdict),
+    )
+    conn.commit()
+
+
+def _insert_weekly_summary(
+    conn,
+    *,
+    week_start: str,
+    week_end: str,
+    signal_count: int = 4,
+    body: str = "weekly body",
+    sent: int = 1,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO weekly_summaries (
+            week_start, week_end, generated_at, body,
+            signal_count, buy_count,
+            top_drop_symbol, top_drop_pct, sent
+        ) VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, ?)
+        """,
+        (week_start, week_end, week_end, body, signal_count, sent),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+# ---------- /api/signals ----------
+
+class TestSignalsList:
+
+    def test_returns_empty_with_pagination_meta(self, client):
+        resp = client.get("/api/signals")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["data"] == []
+        assert body["meta"] == {
+            "total": 0, "limit": 50, "offset": 0, "next_offset": None,
+        }
+
+    def test_pagination_total_and_next_offset(self, client, seed_conn):
+        # Seed 5 signals over a few minutes apart so detected_at orders cleanly.
+        base = datetime.now(UTC)
+        for i in range(5):
+            _insert_signal(
+                seed_conn, symbol="BTCUSDT",
+                detected_at=base - timedelta(minutes=i),
+                severity="strong", score=70 + i,
+            )
+        resp = client.get("/api/signals?limit=2&offset=0")
+        body = resp.json()
+        assert resp.status_code == 200
+        assert len(body["data"]) == 2
+        assert body["meta"]["total"] == 5
+        assert body["meta"]["limit"] == 2
+        assert body["meta"]["offset"] == 0
+        assert body["meta"]["next_offset"] == 2
+
+        resp_last = client.get("/api/signals?limit=2&offset=4")
+        body_last = resp_last.json()
+        assert len(body_last["data"]) == 1
+        assert body_last["meta"]["next_offset"] is None
+
+    def test_filters_by_symbol_and_severity(self, client, seed_conn):
+        now = datetime.now(UTC)
+        _insert_signal(seed_conn, symbol="BTCUSDT", detected_at=now,
+                       severity="strong", score=70)
+        _insert_signal(seed_conn, symbol="ETHUSDT", detected_at=now,
+                       severity="strong", score=72)
+        _insert_signal(seed_conn, symbol="BTCUSDT", detected_at=now,
+                       severity="normal", score=55)
+
+        resp = client.get("/api/signals?symbol=BTCUSDT")
+        assert {r["symbol"] for r in resp.json()["data"]} == {"BTCUSDT"}
+        assert resp.json()["meta"]["total"] == 2
+
+        resp = client.get("/api/signals?severity=strong")
+        assert {r["severity"] for r in resp.json()["data"]} == {"strong"}
+        assert resp.json()["meta"]["total"] == 2
+
+    def test_filters_by_from_to_window(self, client, seed_conn):
+        old = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+        recent = datetime(2026, 4, 20, 12, 0, tzinfo=UTC)
+        _insert_signal(seed_conn, symbol="BTCUSDT", detected_at=old)
+        _insert_signal(seed_conn, symbol="BTCUSDT", detected_at=recent)
+
+        resp = client.get(
+            "/api/signals?from=2026-04-01T00:00:00Z&to=2026-05-01T00:00:00Z"
+        )
+        rows = resp.json()["data"]
+        assert len(rows) == 1
+        assert rows[0]["detected_at"] == "2026-04-20T12:00:00Z"
+
+
+class TestSignalDetail:
+
+    def test_returns_404_for_unknown(self, client):
+        resp = client.get("/api/signals/999999")
+        assert resp.status_code == 404
+
+    def test_returns_signal_without_evaluation_when_none(
+        self, client, seed_conn,
+    ):
+        sig_id = _insert_signal(
+            seed_conn, symbol="BTCUSDT",
+            detected_at=datetime(2026, 4, 23, 15, 0, tzinfo=UTC),
+            severity="strong", score=72,
+        )
+        resp = client.get(f"/api/signals/{sig_id}")
+        assert resp.status_code == 200
+        body = resp.json()["data"]
+        assert body["id"] == sig_id
+        assert body["evaluation"] is None
+        assert body["score_breakdown"] == {}
+
+    def test_includes_evaluation_block_when_available(
+        self, client, seed_conn,
+    ):
+        sig_id = _insert_signal(
+            seed_conn, symbol="BTCUSDT",
+            detected_at=datetime(2026, 3, 23, 15, 0, tzinfo=UTC),
+            severity="strong", score=72,
+        )
+        _seed_signal_evaluation(
+            seed_conn, signal_id=sig_id,
+            return_7d_pct=10.0, verdict="great",
+        )
+        body = client.get(f"/api/signals/{sig_id}").json()["data"]
+        assert body["evaluation"] is not None
+        assert body["evaluation"]["return_7d_pct"] == 10.0
+        assert body["evaluation"]["verdict"] == "great"
+
+    def test_score_breakdown_round_trips_json(self, client, seed_conn):
+        # Hand-insert a row with a structured score_breakdown payload to
+        # confirm the API parses + ships the JSON intact.
+        seed_conn.execute(
+            """
+            INSERT INTO signals (
+                symbol, detected_at, candle_hour, price_at_signal,
+                score, severity, trigger_reason, reversal_signal,
+                score_breakdown
+            ) VALUES (?, ?, ?, 100.0, 72, 'strong', 't', 0, ?)
+            """,
+            (
+                "BTCUSDT",
+                "2026-04-23T15:00:00Z", "2026-04-23T15:00:00Z",
+                '{"drop_magnitude": {"points": 25}, "trend_context": {"points": 5}}',
+            ),
+        )
+        seed_conn.commit()
+        sig_id = seed_conn.execute("SELECT MAX(id) AS m FROM signals").fetchone()["m"]
+
+        body = client.get(f"/api/signals/{sig_id}").json()["data"]
+        assert body["score_breakdown"]["drop_magnitude"]["points"] == 25
+        assert body["score_breakdown"]["trend_context"]["points"] == 5
+
+
+# ---------- /api/watchlist ----------
+
+class TestWatchlist:
+
+    def test_empty_returns_data_array(self, client):
+        body = client.get("/api/watchlist").json()
+        assert body["data"] == []
+
+    def test_returns_active_rows(self, client, seed_conn):
+        _insert_watching(seed_conn, symbol="BTCUSDT", score=40)
+        _insert_watching(seed_conn, symbol="ETHUSDT", score=42)
+        rows = client.get("/api/watchlist").json()["data"]
+        assert {r["symbol"] for r in rows} == {"BTCUSDT", "ETHUSDT"}
+        for r in rows:
+            assert r["status"] == "watching"
+
+
+# ---------- /api/open-buys ----------
+
+class TestOpenBuys:
+
+    def test_empty_when_no_open_buys(self, client):
+        body = client.get("/api/open-buys").json()
+        assert body["data"] == []
+
+    def test_open_buy_with_watermark_and_current_price(
+        self, client, seed_conn,
+    ):
+        buy_id = _insert_buy(seed_conn, symbol="BTCUSDT")
+        # Seed a watermark and a recent 1h candle for "current price".
+        seed_conn.execute(
+            "INSERT INTO sell_tracking (symbol, buy_id, high_watermark, updated_at) "
+            "VALUES ('BTCUSDT', ?, 130.0, '2026-04-23T15:00:00Z')",
+            (buy_id,),
+        )
+        _insert_candle(
+            seed_conn, symbol="BTCUSDT", interval="1h",
+            open_time=datetime(2026, 4, 23, 14, 0, tzinfo=UTC),
+        )
+        seed_conn.commit()
+
+        rows = client.get("/api/open-buys").json()["data"]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["symbol"] == "BTCUSDT"
+        assert row["high_watermark"] == 130.0
+        # Buy price is 100; current = 100 (latest candle close) -> pnl = 0
+        assert row["current_price"] == 100.0
+        assert row["pnl_pct"] == 0.0
+        # Drawdown from 130 to 100 ≈ -23.08%
+        assert row["drawdown_from_high_pct"] is not None
+        assert row["drawdown_from_high_pct"] < -20.0
+        assert row["latest_close_at"] == "2026-04-23T15:00:00Z"
+
+    def test_open_buy_without_candles_keeps_price_fields_null(
+        self, client, seed_conn,
+    ):
+        _insert_buy(seed_conn, symbol="BTCUSDT")
+        rows = client.get("/api/open-buys").json()["data"]
+        assert len(rows) == 1
+        assert rows[0]["current_price"] is None
+        assert rows[0]["pnl_pct"] is None
+        assert rows[0]["drawdown_from_high_pct"] is None
+
+
+# ---------- /api/buys ----------
+
+class TestBuysList:
+
+    def test_status_open_excludes_sold_rows(self, client, seed_conn):
+        open_id = _insert_buy(seed_conn, symbol="BTCUSDT")
+        sold_id = _insert_buy(seed_conn, symbol="ETHUSDT")
+        seed_conn.execute(
+            "UPDATE buys SET sold_at = ?, sold_price = 110.0 WHERE id = ?",
+            ("2026-04-22T15:00:00Z", sold_id),
+        )
+        seed_conn.commit()
+
+        body = client.get("/api/buys?status=open").json()
+        assert body["meta"]["total"] == 1
+        assert body["data"][0]["id"] == open_id
+        # sold_* columns project on every row, even open ones.
+        assert body["data"][0]["sold_at"] is None
+
+    def test_status_sold_includes_sold_at_price(self, client, seed_conn):
+        b = _insert_buy(seed_conn, symbol="BTCUSDT")
+        seed_conn.execute(
+            "UPDATE buys SET sold_at = ?, sold_price = 110.0, "
+            "sold_note = 'took profit' WHERE id = ?",
+            ("2026-04-22T15:00:00Z", b),
+        )
+        seed_conn.commit()
+
+        body = client.get("/api/buys?status=sold").json()
+        assert body["meta"]["total"] == 1
+        row = body["data"][0]
+        assert row["sold_at"] == "2026-04-22T15:00:00Z"
+        assert row["sold_price"] == 110.0
+        assert row["sold_note"] == "took profit"
+
+    def test_pagination_metadata(self, client, seed_conn):
+        for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+            _insert_buy(seed_conn, symbol=sym)
+        body = client.get("/api/buys?limit=2").json()
+        assert body["meta"]["total"] == 3
+        assert body["meta"]["next_offset"] == 2
+
+    def test_invalid_status_rejected_by_pattern(self, client):
+        # FastAPI's Query(..., pattern=...) returns 422 for non-matching values.
+        resp = client.get("/api/buys?status=lolwut")
+        assert resp.status_code == 422
+
+
+# ---------- /api/sell-signals ----------
+
+class TestSellSignalsList:
+
+    def test_empty(self, client):
+        body = client.get("/api/sell-signals").json()
+        assert body["data"] == []
+        assert body["meta"]["total"] == 0
+
+    def test_filter_by_rule(self, client, seed_conn):
+        buy_id = _insert_buy(seed_conn, symbol="BTCUSDT")
+        now = datetime.now(UTC)
+        _insert_sell_signal(seed_conn, buy_id=buy_id, detected_at=now,
+                            rule="stop_loss", pnl_pct=-12.0)
+        _insert_sell_signal(seed_conn, buy_id=buy_id, detected_at=now,
+                            rule="take_profit", pnl_pct=15.0)
+        body = client.get("/api/sell-signals?rule=take_profit").json()
+        assert body["meta"]["total"] == 1
+        assert body["data"][0]["rule_triggered"] == "take_profit"
+
+    def test_filter_by_symbol_and_window(self, client, seed_conn):
+        b1 = _insert_buy(seed_conn, symbol="BTCUSDT")
+        b2 = _insert_buy(seed_conn, symbol="ETHUSDT")
+        old = datetime(2026, 3, 1, tzinfo=UTC)
+        recent = datetime(2026, 4, 20, tzinfo=UTC)
+        _insert_sell_signal(seed_conn, buy_id=b1, symbol="BTCUSDT",
+                            detected_at=old)
+        _insert_sell_signal(seed_conn, buy_id=b2, symbol="ETHUSDT",
+                            detected_at=recent)
+        body = client.get(
+            "/api/sell-signals?symbol=ETHUSDT&from=2026-04-01T00:00:00Z"
+        ).json()
+        assert body["meta"]["total"] == 1
+        assert body["data"][0]["symbol"] == "ETHUSDT"
+
+
+# ---------- /api/analytics ----------
+
+class TestAnalytics:
+
+    def test_empty_returns_zero_total(self, client):
+        body = client.get("/api/analytics?scope=all").json()
+        assert body["meta"]["scope"] == "all"
+        assert body["data"]["total_signals"] == 0
+        assert body["data"]["overall"]["count"] == 0
+
+    def test_aggregator_results_are_serialized(self, client, seed_conn):
+        # Build 6 evaluated signals with mixed outcomes.
+        for i, ret in enumerate((10.0, 12.0, -5.0, 8.0, -2.0, 15.0)):
+            seed_conn.execute(
+                """
+                INSERT INTO signals (
+                    symbol, detected_at, candle_hour, price_at_signal,
+                    score, severity, trigger_reason, reversal_signal,
+                    score_breakdown, dominant_trigger_timeframe,
+                    regime_at_signal
+                ) VALUES (?, ?, ?, 100.0, 70, 'strong', 't', 0, '{}',
+                          '7d', 'neutral')
+                """,
+                (f"X{i}USDT",
+                 f"2026-03-{20-i:02d}T12:00:00Z",
+                 f"2026-03-{20-i:02d}T12:00:00Z"),
+            )
+            sig_id = int(
+                seed_conn.execute("SELECT MAX(id) FROM signals").fetchone()[0]
+            )
+            _seed_signal_evaluation(
+                seed_conn, signal_id=sig_id, return_7d_pct=ret,
+            )
+
+        body = client.get("/api/analytics?scope=all&min_signals=1").json()
+        assert body["data"]["total_signals"] == 6
+        assert body["data"]["overall"]["count"] == 6
+        # 4 wins + 2 losses -> 66.67% win rate.
+        assert body["data"]["overall"]["win_rate"] is not None
+        assert 60 <= body["data"]["overall"]["win_rate"] <= 70
+
+    def test_invalid_scope_rejected(self, client):
+        resp = client.get("/api/analytics?scope=180d")
+        assert resp.status_code == 422
+
+
+# ---------- /api/weekly-summaries ----------
+
+class TestWeeklySummariesList:
+
+    def test_empty(self, client):
+        body = client.get("/api/weekly-summaries").json()
+        assert body["data"] == []
+        assert body["meta"]["limit"] == 20
+
+    def test_returns_newest_first(self, client, seed_conn):
+        _insert_weekly_summary(
+            seed_conn,
+            week_start="2026-04-04T00:00:00Z",
+            week_end="2026-04-11T00:00:00Z",
+            body="older week",
+        )
+        _insert_weekly_summary(
+            seed_conn,
+            week_start="2026-04-11T00:00:00Z",
+            week_end="2026-04-18T00:00:00Z",
+            body="newer week",
+        )
+        rows = client.get("/api/weekly-summaries").json()["data"]
+        assert rows[0]["body"] == "newer week"
+        assert rows[1]["body"] == "older week"
+
+    def test_limit_param_respected(self, client, seed_conn):
+        for i in range(3):
+            _insert_weekly_summary(
+                seed_conn,
+                week_start=f"2026-{i+1:02d}-01T00:00:00Z",
+                week_end=f"2026-{i+1:02d}-08T00:00:00Z",
+            )
+        body = client.get("/api/weekly-summaries?limit=2").json()
+        assert len(body["data"]) == 2
+        assert body["meta"]["limit"] == 2
+
+
+# ---------- /api/regime/* ----------
+
+class TestRegimeEndpoints:
+
+    def test_latest_returns_null_when_absent(self, client):
+        body = client.get("/api/regime/latest").json()
+        assert body["data"] is None
+
+    def test_latest_returns_most_recent_snapshot(self, client, seed_conn):
+        for label, ts in (
+            ("risk_on", "2026-04-22T12:00:00Z"),
+            ("risk_off", "2026-04-23T12:00:00Z"),
+        ):
+            seed_conn.execute(
+                """
+                INSERT INTO regime_snapshots
+                    (label, btc_ema_short, btc_ema_long, btc_atr_14d,
+                     atr_percentile, determined_at)
+                VALUES (?, 45000.0, 43000.0, 1200.0, 35.0, ?)
+                """,
+                (label, ts),
+            )
+        seed_conn.commit()
+        data = client.get("/api/regime/latest").json()["data"]
+        assert data["label"] == "risk_off"
+        assert data["determined_at"] == "2026-04-23T12:00:00Z"
+
+    def test_history_respects_limit_and_orders_newest_first(
+        self, client, seed_conn,
+    ):
+        for i, ts in enumerate((
+            "2026-04-21T12:00:00Z",
+            "2026-04-22T12:00:00Z",
+            "2026-04-23T12:00:00Z",
+        )):
+            seed_conn.execute(
+                """
+                INSERT INTO regime_snapshots
+                    (label, btc_ema_short, btc_ema_long, btc_atr_14d,
+                     atr_percentile, determined_at)
+                VALUES ('neutral', 1.0, 1.0, 1.0, ?, ?)
+                """,
+                (50.0 + i, ts),
+            )
+        seed_conn.commit()
+        body = client.get("/api/regime/history?limit=2").json()
+        assert len(body["data"]) == 2
+        assert body["data"][0]["determined_at"] == "2026-04-23T12:00:00Z"
+        assert body["data"][1]["determined_at"] == "2026-04-22T12:00:00Z"
+
+
+# ---------- locked-DB → 503 on a Step-2 endpoint ----------
+
+class TestStep2LockedDb:
+
+    def test_signals_list_503_when_db_locked(self, client, monkeypatch):
+        def _boom(_conn, **_kw):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(dashboard_api, "build_signals_page", _boom)
+        resp = client.get("/api/signals")
+        assert resp.status_code == 503
+
+
+# ---------- OpenAPI surface (Step 2) ----------
+
+class TestStep2OpenApi:
+
+    def test_all_step2_routes_present(self, client):
+        paths = client.get("/api/openapi.json").json()["paths"]
+        for p in (
+            "/api/signals",
+            "/api/signals/{signal_id}",
+            "/api/watchlist",
+            "/api/open-buys",
+            "/api/buys",
+            "/api/sell-signals",
+            "/api/analytics",
+            "/api/weekly-summaries",
+            "/api/regime/latest",
+            "/api/regime/history",
+        ):
+            assert p in paths, f"missing path: {p}"
