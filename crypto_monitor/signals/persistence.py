@@ -371,12 +371,15 @@ def load_candles(
 def insert_signal(
     conn: sqlite3.Connection,
     candidate: SignalCandidate,
+    *,
+    commit: bool = True,
 ) -> InsertResult:
     """Persist a SignalCandidate if the dedup rules allow it.
 
     See module docstring for the full rule set. The function commits
     only on a successful write; the caller's broader transaction is
-    untouched on skip outcomes.
+    untouched on skip outcomes. Pass ``commit=False`` when insertion
+    belongs to a caller-owned transaction, such as watchlist promotion.
     """
     if candidate.severity is None:
         return InsertResult(
@@ -414,7 +417,8 @@ def insert_signal(
             inserted=False, signal_id=None, reason=REASON_DUPLICATE
         )
 
-    conn.commit()
+    if commit:
+        conn.commit()
     return InsertResult(inserted=True, signal_id=cur.lastrowid, reason=reason)
 
 

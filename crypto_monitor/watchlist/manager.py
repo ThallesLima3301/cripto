@@ -3,15 +3,16 @@
 Given a new score observation and the current watchlist state for a
 symbol, :func:`decide_watch_action` returns exactly one of four tags
 — it does not touch the database, does not insert signals, does not
-notify. The scheduler wiring (a later block) reads the tag and calls
+notify. The scheduler reads the tag and calls
 the appropriate ``store`` helper.
 
 State transitions
 -----------------
 
 Let ``E`` = regular buy-signal emit threshold
-(``scoring.thresholds.min_signal_score`` plus any regime adjust)
-and ``F`` = ``watchlist.floor_score``.
+(computed by ``signals.policy.effective_emit_floor``)
+and ``F`` = min(``watchlist.floor_score``, ``E``). Lowering the
+emission floor below the watch floor collapses the borderline band.
 
 ======================  ==============================  =============
 score vs thresholds      has_active_watch = False        has_active_watch = True

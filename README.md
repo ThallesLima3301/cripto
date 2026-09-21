@@ -139,8 +139,14 @@ the cap still applies, so the factor never grows past its budget.
 - Latest snapshot is stamped on every emitted signal as
   `signals.regime_at_signal` and persisted in `regime_snapshots`.
 - The emit threshold is shifted by `threshold_adjust_risk_on` /
-  `threshold_adjust_risk_off`. Severity tier boundaries are
-  unchanged — only the emit floor moves.
+  `threshold_adjust_risk_off`. The `strong` and `very_strong` tier
+  boundaries stay fixed. Signals newly admitted below the usual
+  `normal` floor receive normal severity.
+- Scoring and watchlist promotion share the same effective floor:
+  `max(min_signal_score + adjustment, normal + min(adjustment, 0))`.
+  This preserves a custom normal floor without a regime adjustment,
+  while allowing risk-on to relax it. With the defaults the floor is
+  45 in risk-on, 50 in neutral, and 55 in risk-off.
 - BTC candles are auto-seeded for ingestion when the regime feature
   is enabled, even if BTCUSDT isn't in `[symbols].tracked`.
 
@@ -264,7 +270,7 @@ public surface:
 Every cross-layer call is dependency-injected (settings, DB
 connection, ntfy sender, clock) so the orchestrators are
 exhaustively tested against in-memory SQLite without touching the
-network. The main test suite has **625 tests**.
+network. The main test suite has **666 tests**.
 
 ---
 
@@ -317,14 +323,16 @@ Per scan cycle, for each tracked symbol:
      divergence (+2 when `divergence_enabled = true`); capped at 10.
    - **Trend context** — 1d trend label rewards buying dips inside
      a rising market.
-3. Map total to a severity tier (`normal` / `strong` / `very_strong`).
-4. Apply the regime threshold adjustment to the **emit floor only**
-   (tier boundaries unchanged).
+3. Apply the shared regime-adjusted emission floor. Below it the
+   candidate has no severity and cannot emit.
+4. Classify eligible candidates as `normal`, `strong`, or
+   `very_strong`; the two stronger tier boundaries remain fixed.
 5. Insert the row when severity is non-None, with rule-driven dedup
    against existing rows for the same `(symbol, candle_hour)`.
 
-When the watchlist feature is enabled and the regular emit declined,
-the watchlist state machine takes over (see [Watchlist](#watchlist)).
+When watchlists are enabled, every candidate goes through their
+state machine, including candidates already eligible to emit. This
+lets a regular signal resolve its active watch (see [Watchlist](#watchlist)).
 
 ---
 
@@ -356,22 +364,28 @@ removes it from future evaluations.
 
 ## Watchlist
 
-When `[watchlist].enabled = true` and the buy-signal path returned
-`severity is None`, the state machine decides:
+When `[watchlist].enabled = true`, the state machine uses the same
+effective emission floor as the scoring engine:
 
-- **PROMOTE** — `score >= min_signal_score` (the **base** value, not
-  the regime-adjusted floor). Synthesizes a severity from the
-  `[scoring.severity]` ladder, threads `watchlist_id` into the
-  candidate, and runs the normal `insert_signal` path. On a
-  successful insert, the watch row transitions to `status='promoted'`
-  with `resolution_reason='promoted'` and stamps `promoted_signal_id`.
-- **WATCH** — `floor_score <= score < min_signal_score`. Inserts (or
+- **PROMOTE** — score reaches the effective floor and the engine
+  allows emission. Uses the engine's severity, links any active watch
+  through `signals.watchlist_id`, and runs the normal dedup insert.
+  A successful insert and watch transition to `status='promoted'`
+  (including `promoted_signal_id`) are saved atomically. Duplicate
+  or superseded signals leave the active watch unchanged.
+- **WATCH** — `floor_score <= score < effective_floor`. Inserts (or
   refreshes) the active row; `expires_at` rolls forward to
   `now + max_watch_hours`.
 - **EXPIRE** — `score < floor_score` and an active watch exists.
   Transitions to `status='expired'` with
   `resolution_reason='expired_below_floor'`.
 - **IGNORE** — `score < floor_score` and no active watch. No-op.
+
+If the regime lowers the emission floor below `floor_score`, there
+is no borderline band: eligible scores emit directly, while lower
+scores expire an active watch or are ignored. The watchlist never
+overrides a regime rejection. With the feature disabled, existing
+watch rows are untouched and regular signal processing continues.
 
 Once per scan cycle, `expire_stale` transitions every
 `status='watching'` row whose `expires_at <= now`, even for symbols
@@ -928,7 +942,7 @@ scripts/
 ├── maintenance.yml
 ├── weekly.yml
 └── buy-add.yml
-tests/                   pytest suite (625 tests against in-memory SQLite)
+tests/                   pytest suite (666 tests against in-memory SQLite)
 ```
 
 `data\` and `logs\` are created on demand. Both, plus `.env` and

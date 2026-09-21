@@ -91,6 +91,9 @@ divergence_enabled = false
 
 [scoring.severity]
 # Score thresholds for each severity tier.
+# A negative regime adjustment also relaxes the normal floor;
+# strong and very_strong keep their thresholds. Scoring and watchlist
+# promotion always use the same effective emission floor.
 normal      = 50
 strong      = 65
 very_strong = 80
@@ -148,12 +151,13 @@ threshold_adjust_risk_off = 5
 
 [watchlist]
 # Watchlist for borderline setups. When a symbol scores below the
-# regular emit floor (`scoring.thresholds.min_signal_score`) but at or
+# regime-adjusted emit floor (shared with signal scoring) but at or
 # above `floor_score`, the scheduler can park it here until either
 # the score climbs past the emit floor (promotion) or `max_watch_hours`
-# elapses (expiration). Block 22 ships the schema and state machine;
-# scheduler wiring lands in a later block. Leaving `enabled = false`
-# keeps the subsystem inert.
+# elapses without a refresh (expiration). Emission links and resolves
+# an active watch in the same transaction. Leaving `enabled = false`
+# keeps the subsystem inert. If the regime lowers the emission floor
+# below floor_score, eligible scores emit without a borderline band.
 enabled = false
 # Lowest score worth watching. Scores below this are ignored entirely.
 floor_score = 35

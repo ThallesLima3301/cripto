@@ -11,7 +11,7 @@ Contract:
   * Returns `SignalCandidate` when `candles_1h` has at least one entry
     (we need a close price and a candle hour to identify the signal).
   * Returns `None` ONLY when there is no usable closed 1h candle data.
-  * A candidate below `min_signal_score` is still returned; its
+  * A candidate below the effective emission floor is still returned; its
     `severity` is `None` and `should_emit` is False. Callers decide
     whether to persist — this keeps the engine's behavior observable.
 
@@ -46,6 +46,7 @@ from crypto_monitor.signals.factors import (
     score_support_distance,
     score_trend_context,
 )
+from crypto_monitor.signals.policy import severity_for_score
 from crypto_monitor.signals.types import SignalCandidate
 from crypto_monitor.utils.time_utils import now_utc, to_utc_iso
 
@@ -69,7 +70,7 @@ def score_signal(
         severity. Lets the scheduler raise the bar in risk-off regimes
         (positive value) or lower it in risk-on regimes (negative value)
         without mutating shared config. Has no effect on the raw score
-        or on severity tier thresholds; only the emit gate moves.
+        or on strong/very-strong tier thresholds; only the emit gate moves.
     """
     if not candles_1h:
         return None
@@ -157,7 +158,7 @@ def score_signal(
         drop_pts + rsi_pts + vol_pts + sup_pts + disc_pts + rev_pts + trend_pts
     )
 
-    severity = _severity_for(total_score, scoring, min_score_adjust)
+    severity = severity_for_score(total_score, scoring, min_score_adjust)
     trigger_reason = _trigger_reason(
         dom_tf, drop_trigger_pct, rsi_1h_val, rel_vol_val, reversal.pattern_name
     )
@@ -287,31 +288,6 @@ def _compute_highs_and_discounts(
         out["discount_180d_pct"] = max((high_180 - price) / high_180 * 100.0, 0.0)
 
     return out
-
-
-def _severity_for(
-    score: int,
-    scoring: ScoringSettings,
-    min_score_adjust: int = 0,
-) -> str | None:
-    """Map a numeric score to a severity tier, or None if below threshold.
-
-    The effective emit threshold is ``min_signal_score + min_score_adjust``
-    so the scheduler can shift the gate by regime without touching config
-    or the tier ladder. Tier boundaries (normal/strong/very_strong) are
-    intentionally left untouched — only the emit floor moves.
-    """
-    s = scoring.severity
-    effective_floor = scoring.thresholds.min_signal_score + min_score_adjust
-    if score < effective_floor:
-        return None
-    if score >= s.very_strong:
-        return "very_strong"
-    if score >= s.strong:
-        return "strong"
-    if score >= s.normal:
-        return "normal"
-    return None
 
 
 def _trigger_reason(

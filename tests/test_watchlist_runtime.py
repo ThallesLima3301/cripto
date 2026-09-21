@@ -1,11 +1,15 @@
 """Block 23 — watchlist integration into the scan loop.
 
 The scoring engine itself is exhaustively tested elsewhere
-(``test_signal_engine.py``). Here we monkey-patch
+(``test_signal_engine.py``). Most state-machine tests monkey-patch
 ``crypto_monitor.scheduler.entrypoints.score_signal`` to return a
 fabricated ``SignalCandidate`` with a chosen ``score`` and
 ``severity`` so we can drive every state-machine branch
 deterministically.
+
+Regime integration regressions at the end use the real scoring engine
+and SQLite candles, so an inconsistent fabricated score/severity pair
+cannot hide an emission-threshold mismatch.
 
 Coverage:
   * borderline score creates a watching entry
@@ -22,7 +26,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -51,7 +55,11 @@ from crypto_monitor.database.connection import get_connection
 from crypto_monitor.database.migrations import run_migrations
 from crypto_monitor.database.schema import init_db, seed_default_symbols
 from crypto_monitor.notifications.ntfy import REASON_SENT, SendResult
+from crypto_monitor.regime import RegimeSnapshot
 from crypto_monitor.scheduler import run_scan
+from crypto_monitor.scheduler.entrypoints import ScanReport, WatchlistReport
+from crypto_monitor.signals import score_signal
+from crypto_monitor.signals.persistence import load_candles
 from crypto_monitor.signals.types import SignalCandidate
 from crypto_monitor.watchlist import (
     expire_below_floor,
@@ -328,13 +336,12 @@ class TestPromotePath:
         watch = get_watching(db, symbol="BTCUSDT")
         assert watch is not None
 
-        # Cycle 2 — qualifying (severity=None forces the watchlist
-        # branch, score=72 >= min_signal_score=50 -> PROMOTE).
+        # Cycle 2: the engine already assigns the qualifying severity.
         # Use a different candle_hour so dedup never fires.
         _patch_score(
             monkeypatch,
             lambda *a, **kw: _candidate(
-                score=72, severity=None,
+                score=72, severity="strong",
                 detected_at="2026-04-23T16:00:00Z",
             ),
         )
@@ -356,7 +363,7 @@ class TestPromotePath:
         sig_id = row["promoted_signal_id"]
         assert sig_id is not None
 
-        # The new signal carries the watchlist linkage AND the synthesized severity.
+        # The new signal carries the watchlist linkage and engine severity.
         sig = db.execute(
             "SELECT id, severity, watchlist_id FROM signals WHERE id = ?",
             (sig_id,),
@@ -367,7 +374,7 @@ class TestPromotePath:
     def test_promotion_with_no_active_watch_still_inserts(
         self, db, tmp_path, monkeypatch
     ):
-        """A score >= min_signal_score with severity=None and no
+        """A score >= min_signal_score with a qualifying severity and no
         active watch should insert a signal but leave watchlist_id NULL.
         """
         settings = _settings(tmp_path)
@@ -376,7 +383,7 @@ class TestPromotePath:
 
         _patch_score(
             monkeypatch,
-            lambda *a, **kw: _candidate(score=72, severity=None),
+            lambda *a, **kw: _candidate(score=72, severity="strong"),
         )
         report = run_scan(
             settings=settings, conn=db, client=_NoOpClient(),
@@ -511,7 +518,7 @@ class TestRegularEmitUnchanged:
         )
         # Regular insert path bumped the inserted counter.
         assert report.inserted_signals == 1
-        # Watchlist counters all zero — the non-None severity branch ran first.
+        # With no active watch, emitting a signal needs no watchlist row.
         wl = report.watchlist_report
         assert wl is not None
         assert wl.watched == 0
@@ -524,3 +531,265 @@ class TestRegularEmitUnchanged:
         # The emitted signal has watchlist_id NULL.
         sig = db.execute("SELECT watchlist_id FROM signals").fetchone()
         assert sig["watchlist_id"] is None
+
+
+# ---------- real engine + regime + watchlist integration ----------
+
+def _real_scoring_settings(
+    tmp_path: Path, *, score: int, watchlist_enabled: bool = True,
+) -> Settings:
+    """Use a single real drop factor to reach exact boundary scores.
+
+    The seeded closed candle falls 10%. With all other factor weights
+    zero, its configured drop points are also the actual engine total.
+    The normal/strong/very_strong thresholds remain the production
+    defaults (50/65/80), including the normal floor affected by risk_on.
+    """
+    settings = _settings(tmp_path, watchlist_enabled=watchlist_enabled)
+    scoring = replace(
+        settings.scoring,
+        weights=ScoringWeights(100, 0, 0, 0, 0, 0, 0),
+        thresholds=replace(settings.scoring.thresholds, drop_1h_points=(score,)),
+    )
+    return replace(settings, scoring=scoring, regime=replace(settings.regime, enabled=True))
+
+
+def _seed_real_drop(db: sqlite3.Connection) -> None:
+    seed_default_symbols(db, ["BTCUSDT"])
+    _seed_one_1h_candle(db)
+    db.execute(
+        "UPDATE candles SET open=100, high=100, low=90, close=90 "
+        "WHERE symbol='BTCUSDT' AND interval='1h'"
+    )
+    db.commit()
+
+
+def _snapshot(label: str) -> RegimeSnapshot:
+    return RegimeSnapshot(
+        label=label, btc_ema_short=100.0, btc_ema_long=100.0,
+        btc_atr_14d=1.0, atr_percentile=50.0,
+        determined_at="2026-04-23T15:00:00Z",
+    )
+
+
+def _real_candidate(db, settings, label: str) -> SignalCandidate:
+    adjustment = {
+        "risk_off": settings.regime.threshold_adjust_risk_off,
+        "risk_on": settings.regime.threshold_adjust_risk_on,
+        "neutral": 0,
+    }[label]
+    candidate = score_signal(
+        "BTCUSDT", load_candles(db, "BTCUSDT", "1h"), [], [],
+        settings.scoring, detected_at="2026-04-23T15:00:00Z",
+        regime_at_signal=label, min_score_adjust=adjustment,
+    )
+    assert candidate is not None
+    return candidate
+
+
+def _real_score_cycle(db, settings, label: str) -> ScanReport:
+    report = ScanReport(
+        watchlist_report=WatchlistReport() if settings.watchlist.enabled else None,
+    )
+    ENT_MOD._score_and_persist(
+        db, symbols=["BTCUSDT"], settings=settings, report=report,
+        now=NOW, regime=_snapshot(label),
+    )
+    return report
+
+
+class TestRealEngineRegimeIntegration:
+
+    @pytest.mark.parametrize("watchlist_enabled", [True, False])
+    @pytest.mark.parametrize("has_watch", [True, False])
+    def test_risk_off_never_emits_below_adjusted_floor(
+        self, db, tmp_path, watchlist_enabled, has_watch,
+    ):
+        settings = _real_scoring_settings(
+            tmp_path, score=52, watchlist_enabled=watchlist_enabled,
+        )
+        _seed_real_drop(db)
+        watch = None
+        if has_watch:
+            watch = upsert_watching(
+                db, symbol="BTCUSDT", score=40,
+                now=NOW - timedelta(hours=1), max_watch_hours=48,
+            )
+
+        candidate = _real_candidate(db, settings, "risk_off")
+        assert candidate.score == 52
+        assert candidate.severity is None  # effective floor is 55
+        report = _real_score_cycle(db, settings, "risk_off")
+
+        assert report.errors == []
+        assert report.inserted_signals == 0
+        assert db.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
+        if watchlist_enabled:
+            assert report.watchlist_report.watched == 1
+            assert report.watchlist_report.promoted == 0
+            active = get_watching(db, symbol="BTCUSDT")
+            assert active is not None
+            assert active.last_score == 52
+            if watch is not None:
+                assert active.id == watch.id
+        else:
+            assert report.watchlist_report is None
+            assert get_watching(db, symbol="BTCUSDT") == watch
+
+    @pytest.mark.parametrize(
+        "label,score,severity",
+        [("risk_off", 55, "normal"), ("risk_on", 47, "normal"),
+         ("neutral", 72, "strong")],
+    )
+    @pytest.mark.parametrize("has_watch", [True, False])
+    def test_qualifying_engine_candidate_emits_and_resolves_active_watch(
+        self, db, tmp_path, label, score, severity, has_watch,
+    ):
+        settings = _real_scoring_settings(tmp_path, score=score)
+        _seed_real_drop(db)
+        watch = None
+        if has_watch:
+            watch = upsert_watching(
+                db, symbol="BTCUSDT", score=40,
+                now=NOW - timedelta(hours=1), max_watch_hours=48,
+            )
+
+        candidate = _real_candidate(db, settings, label)
+        assert candidate.score == score
+        assert candidate.severity == severity
+        report = _real_score_cycle(db, settings, label)
+
+        assert report.errors == []
+        assert report.inserted_signals == 1
+        assert report.watchlist_report.promoted == int(has_watch)
+        signal = db.execute("SELECT * FROM signals").fetchone()
+        assert signal["score"] == score
+        assert signal["severity"] == severity
+        assert signal["regime_at_signal"] == label
+        assert signal["watchlist_id"] == (watch.id if watch else None)
+        assert get_watching(db, symbol="BTCUSDT") is None
+        if watch is not None:
+            resolved = db.execute(
+                "SELECT * FROM watchlist WHERE id = ?", (watch.id,),
+            ).fetchone()
+            assert resolved["status"] == "promoted"
+            assert resolved["promoted_signal_id"] == signal["id"]
+            assert resolved["resolution_reason"] == "promoted"
+        else:
+            assert db.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 0
+
+        # Re-evaluating the same closed candle does not duplicate a signal
+        # or count a resolved watch as another promotion.
+        repeated = _real_score_cycle(db, settings, label)
+        assert repeated.errors == []
+        assert repeated.inserted_signals == 0
+        assert repeated.signal_insert_reasons == {"duplicate": 1}
+        assert repeated.watchlist_report.promoted == 0
+        assert db.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == int(has_watch)
+
+    def test_duplicate_does_not_resolve_a_new_active_watch(self, db, tmp_path):
+        settings = _real_scoring_settings(tmp_path, score=72)
+        _seed_real_drop(db)
+        first = _real_score_cycle(db, settings, "neutral")
+        assert first.inserted_signals == 1
+        watch = upsert_watching(
+            db, symbol="BTCUSDT", score=40,
+            now=NOW - timedelta(minutes=5), max_watch_hours=48,
+        )
+
+        report = _real_score_cycle(db, settings, "neutral")
+
+        assert report.errors == []
+        assert report.signal_insert_reasons == {"duplicate": 1}
+        assert report.watchlist_report.promoted == 0
+        assert get_watching(db, symbol="BTCUSDT") == watch
+        assert db.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 1
+        assert db.execute("SELECT watchlist_id FROM signals").fetchone()[0] is None
+
+    @pytest.mark.parametrize("score,expected_status", [(32, "promoted"), (29, "expired")])
+    def test_risk_on_floor_below_watch_floor_still_resolves_active_watch(
+        self, db, tmp_path, score, expected_status,
+    ):
+        settings = _real_scoring_settings(tmp_path, score=score)
+        settings = replace(
+            settings,
+            regime=replace(settings.regime, threshold_adjust_risk_on=-20),
+        )
+        _seed_real_drop(db)
+        watch = upsert_watching(
+            db, symbol="BTCUSDT", score=40,
+            now=NOW - timedelta(hours=1), max_watch_hours=48,
+        )
+        candidate = _real_candidate(db, settings, "risk_on")
+        assert candidate.score == score
+        assert candidate.severity == ("normal" if score >= 30 else None)
+
+        report = _real_score_cycle(db, settings, "risk_on")
+
+        assert report.errors == []
+        assert get_watching(db, symbol="BTCUSDT") is None
+        resolved = db.execute(
+            "SELECT * FROM watchlist WHERE id = ?", (watch.id,),
+        ).fetchone()
+        assert resolved["status"] == expected_status
+        if expected_status == "promoted":
+            assert report.inserted_signals == 1
+            assert report.watchlist_report.promoted == 1
+            signal = db.execute("SELECT * FROM signals").fetchone()
+            assert signal["watchlist_id"] == watch.id
+            assert resolved["promoted_signal_id"] == signal["id"]
+        else:
+            assert report.inserted_signals == 0
+            assert report.watchlist_report.expired_below_floor == 1
+            assert resolved["resolution_reason"] == "expired_below_floor"
+            assert db.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
+
+    def test_failed_promotion_rolls_back_both_signal_and_watch_update(
+        self, db, tmp_path, monkeypatch,
+    ):
+        settings = _real_scoring_settings(tmp_path, score=72)
+        _seed_real_drop(db)
+        watch = upsert_watching(
+            db, symbol="BTCUSDT", score=40,
+            now=NOW - timedelta(hours=1), max_watch_hours=48,
+        )
+
+        def fail_after_watch_update(conn, *, symbol, signal_id, **_):
+            conn.execute(
+                "UPDATE watchlist SET status='promoted', promoted_signal_id=? "
+                "WHERE symbol=? AND status='watching'",
+                (signal_id, symbol),
+            )
+            raise sqlite3.OperationalError("simulated promotion failure")
+
+        monkeypatch.setattr(ENT_MOD, "promote", fail_after_watch_update)
+        report = _real_score_cycle(db, settings, "neutral")
+
+        assert report.errors == ["score BTCUSDT: simulated promotion failure"]
+        assert report.inserted_signals == 0
+        assert report.watchlist_report.promoted == 0
+        assert db.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
+        assert get_watching(db, symbol="BTCUSDT") == watch
+
+    def test_disabled_watchlist_leaves_even_stale_active_watch_untouched(
+        self, db, tmp_path,
+    ):
+        settings = _real_scoring_settings(tmp_path, score=72, watchlist_enabled=False)
+        settings = replace(settings, regime=replace(settings.regime, enabled=False))
+        _seed_real_drop(db)
+        watch = upsert_watching(
+            db, symbol="BTCUSDT", score=40,
+            now=NOW - timedelta(hours=72), max_watch_hours=48,
+        )
+
+        report = run_scan(
+            settings=settings, conn=db, client=_NoOpClient(),
+            now=NOW, sender=_RecordingSender(),
+        )
+
+        assert report.errors == []
+        assert report.inserted_signals == 1
+        assert report.watchlist_report is None
+        assert get_watching(db, symbol="BTCUSDT") == watch
+        assert db.execute("SELECT watchlist_id FROM signals").fetchone()[0] is None

@@ -6,8 +6,8 @@ so the score lands deterministically in a specific severity tier.
 Block 18 also adds tests for `min_score_adjust` — the keyword the
 scheduler uses to shift the emit floor by regime (negative in risk_on,
 positive in risk_off, 0 in neutral or when the regime feature is
-disabled). The shift only moves the emit gate; tier boundaries are
-intentionally untouched.
+disabled). The shift moves the emit gate; the strong and very-strong
+tier boundaries are intentionally untouched.
 
 The canonical "crash" series built by `_build_crash_series` produces
 exactly 70 points with config.example weights:
@@ -298,10 +298,9 @@ def _scoring_with_floor(scoring: ScoringSettings, floor: int) -> ScoringSettings
 def _scoring_with_severity_split(scoring: ScoringSettings, *, floor: int, normal: int) -> ScoringSettings:
     """Return a copy with a custom emit floor AND a lower severity.normal.
 
-    The default conftest fixture sets ``min_signal_score == severity.normal``,
-    so a *negative* `min_score_adjust` cannot promote a candidate without
-    also relaxing the severity ladder. This helper drops `severity.normal`
-    below `floor` so the risk_on case is observable end-to-end.
+    This exercises configurations where the minimum score is stricter
+    than the normal tier. Regime adjustments change emission eligibility
+    while the strong and very-strong boundaries remain unchanged.
     """
     new_th = dataclasses.replace(scoring.thresholds, min_signal_score=floor)
     new_sev = dataclasses.replace(scoring.severity, normal=normal)

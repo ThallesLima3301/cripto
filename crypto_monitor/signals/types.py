@@ -2,7 +2,7 @@
 
 `SignalCandidate` is the single output of `score_signal`. It is ALWAYS
 returned when there is enough data to pin down a price and a candle
-hour — even when the total score is below `min_signal_score`. Callers
+hour — even when the score is below the effective emission floor. Callers
 inspect `should_emit` to decide whether the candidate is worth
 persisting / alerting on.
 
@@ -73,5 +73,5 @@ class SignalCandidate:
 
     @property
     def should_emit(self) -> bool:
-        """True when the candidate has a severity (score >= min_signal_score)."""
+        """True when the candidate meets the effective emission policy."""
         return self.severity is not None

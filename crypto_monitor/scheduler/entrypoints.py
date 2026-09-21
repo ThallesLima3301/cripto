@@ -81,6 +81,8 @@ from crypto_monitor.reports.weekly import (
 from crypto_monitor.regime import RegimeSnapshot, classify_regime, save_regime_snapshot
 from crypto_monitor.sell.runtime import ProcessSellReport, process_open_positions
 from crypto_monitor.signals.engine import score_signal
+from crypto_monitor.signals.policy import effective_emit_floor
+from crypto_monitor.signals.types import SignalCandidate
 from crypto_monitor.signals.persistence import (
     REASON_INSERTED,
     InsertResult,
@@ -628,13 +630,10 @@ def _score_and_persist(
     together. Per-symbol errors are isolated so a single bad feed
     doesn't abort the whole scan.
 
-    Block 23 added the watchlist branch: when ``settings.watchlist.enabled``
-    is True and the candidate's severity is None (the regular emit path
-    declined), the manager decides one of WATCH/PROMOTE/EXPIRE/IGNORE.
-    PROMOTE synthesizes a severity from ``ScoringSeverity`` and re-runs
-    through ``insert_signal`` so dedup, breakdown, and downstream alerts
-    behave identically to a regular signal — but the row carries a
-    ``watchlist_id`` linking back to the originating watch.
+    With watchlists enabled every candidate passes through the watch
+    manager using the same emission floor as the signal engine. A newly
+    inserted signal links and resolves its active watch atomically;
+    duplicates leave the watch unchanged.
 
     We only need enough history to satisfy the longest lookback the
     engine might touch (180d on the 1d interval, 30d on the 1h
@@ -644,7 +643,7 @@ def _score_and_persist(
     detected_at = to_utc_iso(now)
     regime_label = regime.label if regime is not None else None
     min_score_adjust = _regime_min_score_adjust(regime, settings)
-    base_min_score = settings.scoring.thresholds.min_signal_score
+    emit_floor = effective_emit_floor(settings.scoring, min_score_adjust)
     wl_enabled = settings.watchlist.enabled
 
     for symbol in symbols:
@@ -669,16 +668,10 @@ def _score_and_persist(
                 continue
             report.scored_symbols += 1
 
-            if candidate.severity is not None:
-                # Regular emit path — unchanged behavior.
-                result: InsertResult = insert_signal(conn, candidate)
-                _record_insert_outcome(report, result)
-                continue
-
-            # Watchlist branch — runs only when the regular signal
-            # didn't emit AND the feature is on. Disabled-watchlist
-            # behavior matches pre-Block-23 exactly.
             if not wl_enabled:
+                if candidate.severity is not None:
+                    result = insert_signal(conn, candidate)
+                    _record_insert_outcome(report, result)
                 continue
 
             _handle_watchlist_decision(
@@ -687,7 +680,7 @@ def _score_and_persist(
                 settings=settings,
                 report=report,
                 now=now,
-                base_min_score=base_min_score,
+                emit_floor=emit_floor,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("scoring failed for %s", symbol)
@@ -706,26 +699,22 @@ def _record_insert_outcome(report: ScanReport, result: InsertResult) -> None:
 def _handle_watchlist_decision(
     conn: sqlite3.Connection,
     *,
-    candidate,
+    candidate: SignalCandidate,
     settings: Settings,
     report: ScanReport,
     now: datetime,
-    base_min_score: int,
+    emit_floor: int,
 ) -> None:
-    """Apply the watchlist state machine to a borderline candidate.
-
-    Called only when ``candidate.severity is None`` and the watchlist
-    feature is enabled. Updates ``report.watchlist_report`` counters
-    and mutates the ``watchlist`` table via the store helpers.
-    """
+    """Apply the watchlist lifecycle to every scored candidate."""
     wl_report = report.watchlist_report
     assert wl_report is not None  # the caller ensures it exists
 
     has_active = get_watching(conn, symbol=candidate.symbol) is not None
     action = decide_watch_action(
         score=candidate.score,
-        min_signal_score=base_min_score,
-        floor_score=settings.watchlist.floor_score,
+        min_signal_score=emit_floor,
+        # A lowered regime gate can eliminate the borderline band.
+        floor_score=min(settings.watchlist.floor_score, emit_floor),
         has_active_watch=has_active,
     )
 
@@ -746,30 +735,12 @@ def _handle_watchlist_decision(
         return
 
     if action == PROMOTE:
-        watch = get_watching(conn, symbol=candidate.symbol)
-        promoted_severity = _severity_for_score(
-            candidate.score, settings.scoring.severity,
-        )
-        if promoted_severity is None:
-            # Defensive: PROMOTE means score >= min_signal_score, and
-            # the default config has severity.normal == min_signal_score
-            # so this branch shouldn't trigger. If a custom config makes
-            # severity.normal > min_signal_score we silently skip.
+        if candidate.severity is None:
+            # Never override a declined engine decision in a second path.
             return
-        promoted_candidate = dataclasses.replace(
-            candidate,
-            severity=promoted_severity,
-            watchlist_id=(watch.id if watch is not None else None),
-        )
-        result: InsertResult = insert_signal(conn, promoted_candidate)
+        result, promoted_watch = _insert_and_promote(conn, candidate, now)
         _record_insert_outcome(report, result)
-        if result.inserted and watch is not None and result.signal_id is not None:
-            promote(
-                conn,
-                symbol=candidate.symbol,
-                signal_id=result.signal_id,
-                now=now,
-            )
+        if promoted_watch:
             wl_report.promoted += 1
         return
 
@@ -777,20 +748,31 @@ def _handle_watchlist_decision(
     wl_report.ignored += 1
 
 
-def _severity_for_score(
-    score: int,
-    severity_cfg,
-) -> str | None:
-    """Map a raw score to a severity tier (no min-score gate).
-
-    Used by the PROMOTE branch — the watchlist already established
-    that the score warrants a signal, so we skip the emit-floor check
-    that ``signals.engine._severity_for`` performs.
-    """
-    if score >= severity_cfg.very_strong:
-        return "very_strong"
-    if score >= severity_cfg.strong:
-        return "strong"
-    if score >= severity_cfg.normal:
-        return "normal"
-    return None
+def _insert_and_promote(
+    conn: sqlite3.Connection,
+    candidate: SignalCandidate,
+    now: datetime,
+) -> tuple[InsertResult, bool]:
+    """Persist the signal and both watch links together, or roll back both."""
+    conn.execute("SAVEPOINT signal_promotion")
+    try:
+        watch = get_watching(conn, symbol=candidate.symbol)
+        linked = dataclasses.replace(
+            candidate, watchlist_id=watch.id if watch is not None else None,
+        )
+        result = insert_signal(conn, linked, commit=False)
+        promoted_watch = False
+        if result.inserted and watch is not None and result.signal_id is not None:
+            resolved = promote(
+                conn, symbol=candidate.symbol, signal_id=result.signal_id,
+                now=now, commit=False,
+            )
+            if resolved is None:
+                raise RuntimeError("active watch disappeared during promotion")
+            promoted_watch = True
+        conn.execute("RELEASE SAVEPOINT signal_promotion")
+        return result, promoted_watch
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT signal_promotion")
+        conn.execute("RELEASE SAVEPOINT signal_promotion")
+        raise

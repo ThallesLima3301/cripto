@@ -102,12 +102,15 @@ def promote(
     symbol: str,
     signal_id: int,
     now: datetime,
+    commit: bool = True,
 ) -> WatchlistEntry | None:
     """Mark the active watch for ``symbol`` as ``promoted``.
 
     Returns the resolved entry (``status='promoted'``) or ``None``
     when no active watch exists — the scheduler can still insert a
-    signal, it simply won't carry a ``watchlist_id`` link.
+    signal, it simply won't carry a ``watchlist_id`` link. Pass
+    ``commit=False`` to resolve the watch and insert its signal in
+    the same caller-owned transaction.
     """
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
@@ -127,7 +130,8 @@ def promote(
         """,
         (int(signal_id), to_utc_iso(now), existing.id),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return _row_by_id(conn, existing.id)
 
 
