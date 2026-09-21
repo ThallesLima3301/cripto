@@ -6,7 +6,7 @@ complementary pieces:
 
   * `signal_eval` — evaluates matured signals. For every signal row
     that is old enough (configurable via `MATURATION_DAYS`) and does
-    not yet have a companion row in `signal_evaluations`, it
+    has no complete companion row in `signal_evaluations`, it
     computes 24h / 7d / 30d returns and max-gain/max-loss over the
     7-day window, assigns a verdict, and writes the row.
 
@@ -19,11 +19,10 @@ complementary pieces:
   * `verdict` — pure mapping from a return percent to a verdict
     label, driven by `EvaluationSettings` thresholds.
 
-Maturation is intentionally strict: we only evaluate a signal or
-buy after the full 30-day window has passed. That keeps each record
-one-shot — inserted once, never updated — and lets the `UNIQUE`
-constraint on `signal_id` / `buy_id` act as the idempotency guard
-during reruns.
+Maturation is intentionally strict: evaluation starts after the full
+30-day window has passed. Missing metrics remain NULL and are filled by
+later runs when the corresponding candles arrive. Complete evaluations
+and unchanged retries are no-ops; each signal or buy keeps one row.
 """
 
 from crypto_monitor.evaluation.buy_eval import (

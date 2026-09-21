@@ -1,7 +1,7 @@
 """Matured buy evaluation.
 
 For every buy row that is at least `MATURATION_DAYS` old and has no
-companion row in `buy_evaluations`, compute:
+complete companion row in `buy_evaluations`, compute:
 
   * the buy day's 1h OPEN  (`day_open`)
   * the buy day's hourly LOW — the minimum of `low` across the 1h
@@ -36,16 +36,20 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 
 from crypto_monitor.config.settings import EvaluationSettings
+from crypto_monitor.evaluation.common import (
+    is_complete,
+    max_gain_loss_with_timing,
+    price_at_horizon,
+    save_evaluation,
+)
 from crypto_monitor.evaluation.verdict import assign_verdict
 from crypto_monitor.evaluation.signal_eval import (
     MATURATION_DAYS,
-    _max_gain_loss_with_timing,
     _pct_change,
-    _price_at_or_after,
 )
 from crypto_monitor.indicators import Candle
 from crypto_monitor.utils.time_utils import (
@@ -140,6 +144,12 @@ class BuyEvalReport:
     skipped_pending: int
 
 
+_METRIC_FIELDS = tuple(
+    field.name for field in fields(BuyEvalResult)
+    if field.name not in {"buy_id", "verdict", "resolution_note"}
+)
+
+
 # ---------- public API ----------
 
 def evaluate_buy(
@@ -152,7 +162,9 @@ def evaluate_buy(
     """Evaluate a single matured buy. Returns None if not matured or missing.
 
     Behaves symmetrically to `evaluate_signal`: skips buys that do
-    not exist, that are already evaluated, or that are too young.
+    not exist, that are completely evaluated, or that are too young.
+    Incomplete evaluations are retried as missing candles arrive. A
+    rerun that adds no information leaves the row and its timestamp alone.
     """
     if now is None:
         now = now_utc()
@@ -182,10 +194,17 @@ def evaluate_buy(
         bought_at=bought_at,
         buy_price=float(row["price"]),
         eval_settings=eval_settings,
+        now=now,
     )
-    _insert_buy_evaluation(conn, result, now)
+    if not _insert_buy_evaluation(conn, result, now, eval_settings):
+        return None
     conn.commit()
-    return result
+    saved = conn.execute(
+        "SELECT * FROM buy_evaluations WHERE buy_id = ?", (buy_id,)
+    ).fetchone()
+    return BuyEvalResult(**{
+        field.name: saved[field.name] for field in fields(BuyEvalResult)
+    })
 
 
 def evaluate_pending_buys(
@@ -194,16 +213,16 @@ def evaluate_pending_buys(
     eval_settings: EvaluationSettings,
     now: datetime | None = None,
 ) -> BuyEvalReport:
-    """Walk every un-evaluated buy and evaluate matured ones."""
+    """Evaluate matured buys whose evaluation is absent or incomplete."""
     if now is None:
         now = now_utc()
 
     rows = conn.execute(
-        """
+        f"""
         SELECT b.id, b.symbol, b.bought_at, b.price
         FROM buys b
         LEFT JOIN buy_evaluations e ON e.buy_id = b.id
-        WHERE e.buy_id IS NULL
+        WHERE e.buy_id IS NULL OR {" OR ".join(f"e.{name} IS NULL" for name in _METRIC_FIELDS)}
         ORDER BY b.bought_at ASC, b.id ASC
         """
     ).fetchall()
@@ -225,9 +244,10 @@ def evaluate_pending_buys(
             bought_at=bought_at,
             buy_price=float(row["price"]),
             eval_settings=eval_settings,
+            now=now,
         )
-        _insert_buy_evaluation(conn, result, now)
-        evaluated += 1
+        if _insert_buy_evaluation(conn, result, now, eval_settings):
+            evaluated += 1
 
     conn.commit()
     return BuyEvalReport(
@@ -244,12 +264,8 @@ def _is_matured(bought_at: datetime, now: datetime) -> bool:
 
 
 def _already_evaluated(conn: sqlite3.Connection, buy_id: int) -> bool:
-    return (
-        conn.execute(
-            "SELECT 1 FROM buy_evaluations WHERE buy_id = ?",
-            (buy_id,),
-        ).fetchone()
-        is not None
+    return is_complete(
+        conn, "buy_evaluations", "buy_id", buy_id, _METRIC_FIELDS
     )
 
 
@@ -261,9 +277,10 @@ def _compute_buy_eval(
     bought_at: datetime,
     buy_price: float,
     eval_settings: EvaluationSettings,
+    now: datetime,
 ) -> BuyEvalResult:
     # --- intraday low via pure helper ---
-    day_candles = _load_day_candles(conn, symbol, bought_at)
+    day_candles = _load_day_candles(conn, symbol, bought_at, now=now)
     day_low = compute_day_low_hourly(day_candles)
 
     if day_low is not None:
@@ -296,14 +313,14 @@ def _compute_buy_eval(
     # --- 7d / 30d returns ---
     t_7d = bought_at + timedelta(days=7)
     t_30d = bought_at + timedelta(days=30)
-    price_7d = _price_at_or_after(conn, symbol, t_7d)
-    price_30d = _price_at_or_after(conn, symbol, t_30d)
+    price_7d = price_at_horizon(conn, symbol, t_7d, now=now)
+    price_30d = price_at_horizon(conn, symbol, t_30d, now=now)
 
     return_7d = _pct_change(buy_price, price_7d)
     return_30d = _pct_change(buy_price, price_30d)
 
     # --- Block 24: MFE / MAE + timing over the 7-day post-buy window ---
-    max_gain_pct, max_loss_pct, t_to_mfe, t_to_mae = _max_gain_loss_with_timing(
+    max_gain_pct, max_loss_pct, t_to_mfe, t_to_mae = max_gain_loss_with_timing(
         conn,
         symbol=symbol,
         start=bought_at,
@@ -338,8 +355,10 @@ def _load_day_candles(
     conn: sqlite3.Connection,
     symbol: str,
     bought_at: datetime,
+    *,
+    now: datetime,
 ) -> list[Candle]:
-    """Load the 1h candles that fall inside the UTC day of `bought_at`."""
+    """Return the complete, closed UTC day or no intraday data at all."""
     day_start = floor_to_day(bought_at)
     day_end = day_start + timedelta(days=1)
     rows = conn.execute(
@@ -352,6 +371,18 @@ def _load_day_candles(
         """,
         (symbol, to_utc_iso(day_start), to_utc_iso(day_end)),
     ).fetchall()
+    if len(rows) != 24:
+        return []
+    for index, row in enumerate(rows):
+        expected_open = day_start + timedelta(hours=index)
+        expected_close = expected_open + timedelta(hours=1)
+        actual_close = from_utc_iso(row["close_time"])
+        if (
+            from_utc_iso(row["open_time"]) != expected_open
+            or not expected_close - timedelta(seconds=1) <= actual_close <= expected_close
+            or expected_close > now
+        ):
+            return []
     return [
         Candle(
             open_time=r["open_time"],
@@ -370,40 +401,8 @@ def _insert_buy_evaluation(
     conn: sqlite3.Connection,
     r: BuyEvalResult,
     now: datetime,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO buy_evaluations (
-            buy_id, evaluated_at, day_open,
-            day_low_hourly, day_low_hourly_time,
-            pct_from_day_open_to_low_hourly,
-            pct_from_buy_to_low_hourly,
-            buy_vs_day_low_hourly_pct,
-            price_7d_later, return_7d_pct,
-            price_30d_later, return_30d_pct,
-            verdict, resolution_note,
-            max_gain_pct, max_loss_pct,
-            time_to_mfe_hours, time_to_mae_hours
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            r.buy_id,
-            to_utc_iso(now),
-            r.day_open,
-            r.day_low_hourly,
-            r.day_low_hourly_time,
-            r.pct_from_day_open_to_low_hourly,
-            r.pct_from_buy_to_low_hourly,
-            r.buy_vs_day_low_hourly_pct,
-            r.price_7d_later,
-            r.return_7d_pct,
-            r.price_30d_later,
-            r.return_30d_pct,
-            r.verdict,
-            r.resolution_note,
-            r.max_gain_pct,
-            r.max_loss_pct,
-            r.time_to_mfe_hours,
-            r.time_to_mae_hours,
-        ),
+    eval_settings: EvaluationSettings,
+) -> bool:
+    return save_evaluation(
+        conn, "buy_evaluations", "buy_id", r, now, eval_settings
     )

@@ -179,8 +179,8 @@ alert.
 - **Buy evaluations**: hourly-resolution intraday low for the buy
   day, 7d / 30d returns, MFE / MAE / timing over the 7-day post-buy
   window, verdict.
-- 30-day maturation window, idempotent — re-running maintenance is
-  a safe no-op.
+- 30-day maturation window. Maintenance fills missing outcomes when
+  candles arrive later; complete results are idempotent.
 
 ### Analytics
 - Pure aggregator (`compute_expectancy`) returns total signals, an
@@ -264,7 +264,7 @@ public surface:
 Every cross-layer call is dependency-injected (settings, DB
 connection, ntfy sender, clock) so the orchestrators are
 exhaustively tested against in-memory SQLite without touching the
-network. The main test suite has **593 tests**.
+network. The main test suite has **625 tests**.
 
 ---
 
@@ -282,6 +282,7 @@ All bot state lives in one SQLite file. Key tables:
 | `notifications` | ntfy dispatch log: queued / sent / retry state, per-attempt errors. |
 | `buys` | Manual buy ledger; `sold_at` / `sold_price` / `sold_note` mark closed positions. |
 | `buy_evaluations` | Matured buy outcomes — hourly intraday low, 7d/30d returns, MFE/MAE + timing, verdict. |
+| `signal_evaluations_legacy_v1` / `buy_evaluations_legacy_v1` | Preserved evaluation rows from before the temporal corrections; excluded from current analytics. |
 | `regime_snapshots` | One row per scan when the regime feature is enabled. |
 | `sell_tracking` | Per-`(symbol, buy_id)` post-entry high watermark used by the trailing-stop rule. |
 | `sell_signals` | Append-only log of fired sell rules: rule, severity, reason, P&L%, regime, alerted flag. |
@@ -291,7 +292,8 @@ All bot state lives in one SQLite file. Key tables:
 
 The full DDL lives in
 [`crypto_monitor/database/schema.py`](crypto_monitor/database/schema.py).
-Five migrations have been applied in order (regime → sell → watchlist → eval timing).
+Schema version 6 includes regime, sell, watchlist, evaluation timing,
+and archival of outcomes computed before the temporal corrections.
 
 ---
 
@@ -381,11 +383,48 @@ not currently scoring.
 
 ### Evaluations
 
-Maintenance (`evaluate`) walks every signal/buy older than 30 days
-that has no row in `signal_evaluations` / `buy_evaluations` and
-computes the price horizons + MFE / MAE / timing + verdict. NULL
-columns (insufficient post-event candles) are surfaced explicitly,
-not silently zeroed.
+Maintenance (`evaluate`) computes matured outcomes and revisits
+partial rows in `signal_evaluations` / `buy_evaluations` when more
+candles become available. Valid metrics already stored survive
+later candle pruning; complete rows are left unchanged. Missing
+data is represented as NULL, and a missing 7-day return gives a
+`pending` verdict.
+
+A signal becomes available at the later of `candle_hour + 1 hour`
+and `detected_at`. Its 30-day maturation and return horizons start
+there, so neither the generating candle nor a processing delay can
+count as post-signal performance. Buy horizons start at `bought_at`.
+Returns still use the recorded `price_at_signal` / buy price as the
+reference; they are descriptive outcomes, not simulated executions.
+
+Each return uses the first scheduled 1h candle close at or after
+its target, less than one hour later. That specific candle must be
+present and fully closed by the evaluation time. A missing 24h
+candle cannot be replaced by a price from several days later.
+Hourly boundaries are determined from `open_time + 1 hour`, including
+exchange candles whose stored `close_time` is one millisecond earlier.
+
+MFE / MAE require all whole hourly candles inside the 7-day window.
+Only candles that open at or after the event and close at or before
+the window's end are included. Candles overlapping either boundary
+are excluded, because their high/low might have occurred outside the
+window. Incomplete coverage leaves these metrics NULL. Timing gives
+the offset to the winning candle's opening, not the exact intrahour
+moment of its high/low; ties select the earliest candle.
+Buy-day open/low statistics similarly require all 24 hourly candles
+of that UTC day; partial-day coverage leaves those metrics NULL.
+
+Schema migration 6 preserves every old evaluation row, including
+its ID and NULL fields, in the SQLite tables
+`signal_evaluations_legacy_v1` and `buy_evaluations_legacy_v1`.
+These are archival tables inside the database, not separate files.
+The migration then clears the two derived evaluation tables so the
+next maintenance run can rebuild outcomes using the corrected rules.
+It leaves signals, buys, and candles intact. Existing archive tables
+prevent repeated startup from clearing newly calculated outcomes.
+If old candles have already been pruned, rebuilt metrics can remain
+NULL or pending; the original values remain available in the archive
+and are excluded from current analytics.
 
 ### Analytics
 
@@ -889,7 +928,7 @@ scripts/
 ├── maintenance.yml
 ├── weekly.yml
 └── buy-add.yml
-tests/                   pytest suite (593 tests against in-memory SQLite)
+tests/                   pytest suite (625 tests against in-memory SQLite)
 ```
 
 `data\` and `logs\` are created on demand. Both, plus `.env` and

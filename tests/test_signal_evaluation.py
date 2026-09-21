@@ -6,7 +6,8 @@ Covers:
     inserted into signal_evaluations)
   * pending / not-enough-future-data behavior (signal too young →
     no row written, reported as skipped_pending)
-  * rerun idempotency (UNIQUE(signal_id) means a second call is a no-op)
+  * retrying incomplete evaluations without duplicating rows or losing data
+  * closed-candle timing, complete excursion windows, and bounded lookups
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ def _insert_signal(
     price: float = 40.0,
     score: int = 72,
     severity: str = "strong",
+    detected_at: str | None = None,
 ) -> int:
     cur = conn.execute(
         """
@@ -48,7 +50,7 @@ def _insert_signal(
         """,
         (
             symbol,
-            candle_hour,  # detected_at ~= candle_hour for test purposes
+            detected_at or candle_hour,
             candle_hour,
             price,
             score,
@@ -94,15 +96,12 @@ def _seed_future_candles(
     window_7d_high: float,
     window_7d_low: float,
 ) -> None:
-    """Insert exactly the candles the evaluator will look up.
+    """Seed the complete 7-day window after the signal candle closes.
 
-    The evaluator uses 1h candles for all price lookups (24h / 7d /
-    30d) AND for the 7-day high/low window. This helper places one
-    candle at each lookup timestamp plus a high-water and low-water
-    candle somewhere inside the 7d window, so we can assert the
-    computed values precisely.
+    ``anchor`` is the opening of the signal candle. Availability is
+    one hour later, so the 24h/7d/30d target prices are the closes of
+    candles opening at anchor +24h/+7d/+30d respectively.
     """
-    # The anchor candle itself. low < high so we have a valid row.
     _insert_candle(
         conn, symbol=symbol,
         open_time=anchor,
@@ -110,35 +109,19 @@ def _seed_future_candles(
         low=price_at_signal, close=price_at_signal,
     )
 
-    # 24h later: exactly one 1h candle.
-    _insert_candle(
-        conn, symbol=symbol,
-        open_time=anchor + timedelta(hours=24),
-        open_=price_24h, high=price_24h, low=price_24h, close=price_24h,
-    )
-
-    # The 7-day high, placed mid-window (+3d).
-    _insert_candle(
-        conn, symbol=symbol,
-        open_time=anchor + timedelta(days=3),
-        open_=window_7d_high, high=window_7d_high,
-        low=window_7d_high, close=window_7d_high,
-    )
-
-    # The 7-day low, placed later in the window (+4d).
-    _insert_candle(
-        conn, symbol=symbol,
-        open_time=anchor + timedelta(days=4),
-        open_=window_7d_low, high=window_7d_low,
-        low=window_7d_low, close=window_7d_low,
-    )
-
-    # 7 days later.
-    _insert_candle(
-        conn, symbol=symbol,
-        open_time=anchor + timedelta(days=7),
-        open_=price_7d, high=price_7d, low=price_7d, close=price_7d,
-    )
+    special_prices = {
+        24: price_24h,
+        72: window_7d_high,
+        96: window_7d_low,
+        168: price_7d,
+    }
+    for hours in range(1, 169):
+        price = special_prices.get(hours, price_at_signal)
+        _insert_candle(
+            conn, symbol=symbol,
+            open_time=anchor + timedelta(hours=hours),
+            open_=price, high=price, low=price, close=price,
+        )
 
     # 30 days later.
     _insert_candle(
@@ -349,9 +332,8 @@ def test_rerunning_evaluation_is_a_noop(memory_db, eval_settings):
 def test_mfe_and_mae_timing_match_seeded_window(memory_db, eval_settings):
     """Signal eval pins the bar that produced the MFE / MAE.
 
-    The standard seed places the high mid-window (+3d → 72h) and the
-    low later (+4d → 96h). Block 24 must surface those offsets on the
-    result and persist them on the row.
+    The high and low are 71h and 95h after signal availability,
+    measured at their candle openings.
     """
     anchor = datetime(2026, 3, 1, 14, 0, tzinfo=UTC)
     signal_id = _insert_signal(
@@ -377,17 +359,16 @@ def test_mfe_and_mae_timing_match_seeded_window(memory_db, eval_settings):
     assert result is not None
     assert result.max_gain_7d_pct == pytest.approx(25.0)
     assert result.max_loss_7d_pct == pytest.approx(-5.0)
-    # +3d high → 72 hours; +4d low → 96 hours.
-    assert result.time_to_mfe_hours == pytest.approx(72.0)
-    assert result.time_to_mae_hours == pytest.approx(96.0)
+    assert result.time_to_mfe_hours == pytest.approx(71.0)
+    assert result.time_to_mae_hours == pytest.approx(95.0)
 
     row = memory_db.execute(
         "SELECT time_to_mfe_hours, time_to_mae_hours "
         "FROM signal_evaluations WHERE signal_id = ?",
         (signal_id,),
     ).fetchone()
-    assert row["time_to_mfe_hours"] == pytest.approx(72.0)
-    assert row["time_to_mae_hours"] == pytest.approx(96.0)
+    assert row["time_to_mfe_hours"] == pytest.approx(71.0)
+    assert row["time_to_mae_hours"] == pytest.approx(95.0)
 
 
 def test_timing_uses_earliest_bar_on_tie(memory_db, eval_settings):
@@ -396,31 +377,13 @@ def test_timing_uses_earliest_bar_on_tie(memory_db, eval_settings):
     signal_id = _insert_signal(
         memory_db, candle_hour="2026-03-01T14:00:00Z", price=100.0
     )
-    # Place the same high at +24h and +96h. The implementation must
-    # return 24h for time_to_mfe_hours.
-    _insert_candle(
-        memory_db, symbol="BTCUSDT",
-        open_time=anchor,
-        open_=100.0, high=100.0, low=100.0, close=100.0,
-    )
-    _insert_candle(
-        memory_db, symbol="BTCUSDT",
-        open_time=anchor + timedelta(hours=24),
-        open_=120.0, high=120.0, low=120.0, close=120.0,
-    )
-    _insert_candle(
-        memory_db, symbol="BTCUSDT",
-        open_time=anchor + timedelta(hours=96),
-        open_=120.0, high=120.0, low=120.0, close=120.0,
-    )
-    # Need a 7d-later anchor so return_7d_pct can be computed (the
-    # verdict path doesn't drive this test, but the row insert needs
-    # *some* candle past the 7d window to mirror real usage).
-    _insert_candle(
-        memory_db, symbol="BTCUSDT",
-        open_time=anchor + timedelta(days=7),
-        open_=120.0, high=120.0, low=120.0, close=120.0,
-    )
+    # Equal highs at +24h and +96h are 23h and 95h after availability.
+    for hours in range(1, 169):
+        price = 120.0 if hours in (24, 96) else 100.0
+        _insert_candle(
+            memory_db, open_time=anchor + timedelta(hours=hours),
+            open_=price, high=price, low=price, close=price,
+        )
     memory_db.commit()
 
     now = anchor + timedelta(days=31)
@@ -428,19 +391,24 @@ def test_timing_uses_earliest_bar_on_tie(memory_db, eval_settings):
         memory_db, signal_id, eval_settings=eval_settings, now=now
     )
     assert result is not None
-    assert result.time_to_mfe_hours == pytest.approx(24.0)
+    assert result.time_to_mfe_hours == pytest.approx(23.0)
 
 
-def test_window_with_only_anchor_candle_zero_offsets(memory_db, eval_settings):
-    """A single bar at the anchor produces 0-hour offsets, not None."""
+def test_signal_candle_extremes_are_excluded(memory_db, eval_settings):
+    """A +150%/-80% move before the signal existed is not performance."""
     anchor = datetime(2026, 3, 1, 14, 0, tzinfo=UTC)
     signal_id = _insert_signal(
         memory_db, candle_hour="2026-03-01T14:00:00Z", price=100.0
     )
-    _insert_candle(
-        memory_db, symbol="BTCUSDT",
-        open_time=anchor,
-        open_=100.0, high=110.0, low=90.0, close=100.0,
+    _seed_future_candles(
+        memory_db, symbol="BTCUSDT", anchor=anchor,
+        price_at_signal=100.0, price_24h=100.0,
+        price_7d=100.0, price_30d=100.0,
+        window_7d_high=105.0, window_7d_low=95.0,
+    )
+    memory_db.execute(
+        "UPDATE candles SET high = 250.0, low = 20.0 WHERE open_time = ?",
+        (anchor.strftime("%Y-%m-%dT%H:%M:%SZ"),),
     )
     memory_db.commit()
 
@@ -449,5 +417,218 @@ def test_window_with_only_anchor_candle_zero_offsets(memory_db, eval_settings):
         memory_db, signal_id, eval_settings=eval_settings, now=now
     )
     assert result is not None
-    assert result.time_to_mfe_hours == pytest.approx(0.0)
-    assert result.time_to_mae_hours == pytest.approx(0.0)
+    assert result.max_gain_7d_pct == pytest.approx(5.0)
+    assert result.max_loss_7d_pct == pytest.approx(-5.0)
+    assert result.time_to_mfe_hours == pytest.approx(71.0)
+    assert result.time_to_mae_hours == pytest.approx(95.0)
+
+
+@pytest.mark.parametrize("elapsed_hours", [720, 720 + 59 / 60, 721])
+def test_maturation_starts_when_signal_candle_closes(
+    memory_db, eval_settings, elapsed_hours
+):
+    anchor = datetime(2026, 3, 1, 14, tzinfo=UTC)
+    signal_id = _insert_signal(memory_db)
+    result = evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings,
+        now=anchor + timedelta(hours=elapsed_hours),
+    )
+    assert (result is not None) == (elapsed_hours == 721)
+    count = memory_db.execute("SELECT COUNT(*) FROM signal_evaluations").fetchone()[0]
+    assert count == int(elapsed_hours == 721)
+
+
+def test_delayed_detection_moves_maturation_and_all_horizons(
+    memory_db, eval_settings
+):
+    anchor = datetime(2026, 3, 1, 14, tzinfo=UTC)
+    available = anchor + timedelta(hours=2, minutes=5)
+    signal_id = _insert_signal(
+        memory_db, price=100.0,
+        detected_at=available.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    # Only 167 complete candles fit between 16:05 and 16:05 seven days later.
+    for hours in range(3, 170):
+        price = 110.0 if hours == 26 else 100.0
+        _insert_candle(
+            memory_db, open_time=anchor + timedelta(hours=hours),
+            open_=price, high=price, low=price, close=price,
+        )
+    # Partial candles on both edges must not contribute excursions.
+    for hours, price in ((2, 100.0), (170, 120.0), (722, 130.0)):
+        _insert_candle(
+            memory_db, open_time=anchor + timedelta(hours=hours),
+            open_=100.0, high=300.0, low=10.0, close=price,
+        )
+    memory_db.commit()
+
+    assert evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings,
+        now=available + timedelta(days=30) - timedelta(seconds=1),
+    ) is None
+    result = evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings,
+        now=available + timedelta(days=30),
+    )
+    assert result is not None
+    assert result.price_24h_later == 110.0
+    assert result.price_7d_later == 120.0
+    # The 30d candle is present but still open at 16:05.
+    assert result.price_30d_later is None
+    assert result.max_gain_7d_pct == pytest.approx(10.0)
+    assert result.max_loss_7d_pct == pytest.approx(0.0)
+    assert result.time_to_mfe_hours == pytest.approx(23 + 55 / 60)
+
+    completed = evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings,
+        now=anchor + timedelta(days=30, hours=3),
+    )
+    assert completed is not None
+    assert completed.price_30d_later == 130.0
+
+
+def test_missing_24h_candle_does_not_substitute_day_7(memory_db, eval_settings):
+    anchor = datetime(2026, 3, 1, 14, tzinfo=UTC)
+    signal_id = _insert_signal(memory_db, price=100.0)
+    _insert_candle(
+        memory_db, open_time=anchor + timedelta(days=7),
+        open_=150.0, high=150.0, low=150.0, close=150.0,
+    )
+    memory_db.commit()
+    result = evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings,
+        now=anchor + timedelta(days=31),
+    )
+    assert result is not None
+    assert result.price_24h_later is None
+    assert result.return_24h_pct is None
+    assert result.price_7d_later == 150.0
+    assert result.max_gain_7d_pct is None
+    assert result.max_loss_7d_pct is None
+
+
+def test_missing_window_candle_is_retried_and_completes_same_row(
+    memory_db, eval_settings
+):
+    anchor = datetime(2026, 3, 1, 14, tzinfo=UTC)
+    signal_id = _insert_signal(memory_db, price=100.0)
+    _seed_future_candles(
+        memory_db, symbol="BTCUSDT", anchor=anchor,
+        price_at_signal=100.0, price_24h=101.0,
+        price_7d=110.0, price_30d=120.0,
+        window_7d_high=125.0, window_7d_low=90.0,
+    )
+    gap = anchor + timedelta(hours=50)
+    memory_db.execute(
+        "DELETE FROM candles WHERE open_time = ?",
+        (gap.strftime("%Y-%m-%dT%H:%M:%SZ"),),
+    )
+    memory_db.commit()
+    now = anchor + timedelta(days=31)
+    first = evaluate_signal(memory_db, signal_id, eval_settings=eval_settings, now=now)
+    assert first is not None
+    assert first.return_7d_pct == pytest.approx(10.0)
+    assert first.max_gain_7d_pct is None
+    assert first.max_loss_7d_pct is None
+    row_before = memory_db.execute(
+        "SELECT * FROM signal_evaluations WHERE signal_id = ?", (signal_id,)
+    ).fetchone()
+    assert row_before["max_gain_7d_pct"] is None
+    assert row_before["time_to_mfe_hours"] is None
+
+    _insert_candle(
+        memory_db, open_time=gap,
+        open_=100.0, high=100.0, low=100.0, close=100.0,
+    )
+    memory_db.commit()
+    report = evaluate_pending_signals(
+        memory_db, eval_settings=eval_settings, now=now + timedelta(hours=1)
+    )
+    assert report.considered == 1
+    assert report.evaluated == 1
+    assert report.skipped_pending == 0
+    row_after = memory_db.execute(
+        "SELECT * FROM signal_evaluations WHERE signal_id = ?", (signal_id,)
+    ).fetchone()
+    assert row_after["id"] == row_before["id"]
+    assert row_after["max_gain_7d_pct"] == pytest.approx(25.0)
+    assert row_after["max_loss_7d_pct"] == pytest.approx(-10.0)
+    assert row_after["evaluated_at"] != row_before["evaluated_at"]
+    assert memory_db.execute("SELECT COUNT(*) FROM signal_evaluations").fetchone()[0] == 1
+
+    final = evaluate_pending_signals(
+        memory_db, eval_settings=eval_settings, now=now + timedelta(hours=2)
+    )
+    assert final.considered == 0
+    assert final.evaluated == 0
+
+
+def test_unchanged_partial_retry_preserves_timestamp(memory_db, eval_settings):
+    anchor = datetime(2026, 3, 1, 14, tzinfo=UTC)
+    signal_id = _insert_signal(memory_db)
+    now = anchor + timedelta(days=31)
+    assert evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings, now=now
+    ) is not None
+    before = dict(memory_db.execute("SELECT * FROM signal_evaluations").fetchone())
+    assert evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings,
+        now=now + timedelta(hours=1),
+    ) is None
+    report = evaluate_pending_signals(
+        memory_db, eval_settings=eval_settings, now=now + timedelta(hours=2)
+    )
+    assert report.considered == 1
+    assert report.evaluated == 0
+    assert report.skipped_pending == 0
+    assert dict(memory_db.execute("SELECT * FROM signal_evaluations").fetchone()) == before
+
+
+def test_partial_retry_preserves_results_after_candles_are_pruned(
+    memory_db, eval_settings
+):
+    anchor = datetime(2026, 3, 1, 14, tzinfo=UTC)
+    signal_id = _insert_signal(memory_db, price=100.0)
+    _seed_future_candles(
+        memory_db, symbol="BTCUSDT", anchor=anchor,
+        price_at_signal=100.0, price_24h=101.0,
+        price_7d=110.0, price_30d=120.0,
+        window_7d_high=125.0, window_7d_low=90.0,
+    )
+    horizon_30d = anchor + timedelta(days=30)
+    memory_db.execute(
+        "DELETE FROM candles WHERE open_time = ?",
+        (horizon_30d.strftime("%Y-%m-%dT%H:%M:%SZ"),),
+    )
+    memory_db.commit()
+    now = anchor + timedelta(days=31)
+    first = evaluate_signal(memory_db, signal_id, eval_settings=eval_settings, now=now)
+    assert first is not None
+    assert first.price_30d_later is None
+    assert first.max_gain_7d_pct == pytest.approx(25.0)
+    memory_db.execute("DELETE FROM candles")
+    _insert_candle(
+        memory_db, open_time=horizon_30d,
+        open_=120.0, high=120.0, low=120.0, close=120.0,
+    )
+    memory_db.commit()
+    result = evaluate_signal(
+        memory_db, signal_id, eval_settings=eval_settings,
+        now=now + timedelta(hours=1),
+    )
+    assert result is not None
+    assert result.price_24h_later == 101.0
+    assert result.price_7d_later == 110.0
+    assert result.price_30d_later == 120.0
+    assert result.return_24h_pct == pytest.approx(1.0)
+    assert result.return_7d_pct == pytest.approx(10.0)
+    assert result.return_30d_pct == pytest.approx(20.0)
+    assert result.max_gain_7d_pct == pytest.approx(25.0)
+    assert result.max_loss_7d_pct == pytest.approx(-10.0)
+    assert result.time_to_mfe_hours == first.time_to_mfe_hours
+    assert result.time_to_mae_hours == first.time_to_mae_hours
+    assert result.verdict == VERDICT_GREAT
+    row = memory_db.execute("SELECT * FROM signal_evaluations").fetchone()
+    assert row["return_24h_pct"] == pytest.approx(1.0)
+    assert row["max_gain_7d_pct"] == pytest.approx(25.0)
+    assert row["return_30d_pct"] == pytest.approx(20.0)

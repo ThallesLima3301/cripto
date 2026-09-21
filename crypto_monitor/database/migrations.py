@@ -398,3 +398,27 @@ def _migrate_005_eval_timing(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE buy_evaluations ADD COLUMN time_to_mae_hours REAL"
         )
+
+
+@register_migration(6)
+def _migrate_006_archive_legacy_evaluations(conn: sqlite3.Connection) -> None:
+    """Preserve outcomes computed before the temporal evaluation fixes.
+
+    Legacy calculations could include pre-signal price excursions or
+    substitute a much later candle for a missing return horizon. Keep
+    every original column and value in archival tables, then let normal
+    maintenance rebuild the derived rows from the available candles.
+    Signals, buys, and their original prices remain untouched.
+
+    Each archive is also its own idempotency marker. ``init_db`` can
+    reset the recorded schema version, so checking the version alone
+    would erase newly computed results on a later startup. The runner's
+    SAVEPOINT makes creation, copying, and deletion atomic for both
+    tables; never clear a source whose archive already exists.
+    """
+    for source in ("signal_evaluations", "buy_evaluations"):
+        archive = f"{source}_legacy_v1"
+        if table_exists(conn, archive):
+            continue
+        conn.execute(f"CREATE TABLE {archive} AS SELECT * FROM {source}")
+        conn.execute(f"DELETE FROM {source}")

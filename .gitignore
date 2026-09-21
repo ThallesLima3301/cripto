@@ -26,3 +26,7 @@ config.toml
 .vscode/
 .idea/
 *.swp
+
+# Local tool metadata and generated code maps
+.sf/
+graphify-out/

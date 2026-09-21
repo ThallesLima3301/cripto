@@ -118,9 +118,7 @@ def _seed_buy_day_and_future(
     price_7d: float,
     price_30d: float,
 ) -> None:
-    """Write 24 1h candles for the buy's day plus candles at
-    `bought_at + 7d` and `bought_at + 30d` (the timestamps the
-    evaluator actually looks up)."""
+    """Write the complete buy day and 7d window, plus each target close."""
     assert len(hourly_lows) == 24
     assert len(hourly_opens) == 24
     for i in range(24):
@@ -135,15 +133,35 @@ def _seed_buy_day_and_future(
         )
     _insert_candle_row(
         conn, symbol=symbol,
-        open_time=bought_at + timedelta(days=7),
+        open_time=bought_at + timedelta(days=7, hours=-1),
         open_=price_7d,
     )
     _insert_candle_row(
         conn, symbol=symbol,
-        open_time=bought_at + timedelta(days=30),
+        open_time=bought_at + timedelta(days=30, hours=-1),
         open_=price_30d,
     )
+    _fill_hourly_window(
+        conn, symbol=symbol, start=bought_at,
+        end=bought_at + timedelta(days=7), price=hourly_opens[-1],
+    )
     conn.commit()
+
+
+def _fill_hourly_window(conn, *, symbol, start, end, price=100.0):
+    """Fill missing hourly bars with a flat price, preserving seeded extremes."""
+    current = start.replace(minute=0, second=0, microsecond=0)
+    if current < start:
+        current += timedelta(hours=1)
+    while current + timedelta(hours=1) <= end:
+        existing = conn.execute(
+            "SELECT 1 FROM candles WHERE symbol = ? AND interval = '1h' "
+            "AND open_time = ?",
+            (symbol, current.strftime("%Y-%m-%dT%H:%M:%SZ")),
+        ).fetchone()
+        if existing is None:
+            _insert_candle_row(conn, symbol=symbol, open_time=current, open_=price)
+        current += timedelta(hours=1)
 
 
 # ---------- matured buy evaluation ----------
@@ -436,11 +454,15 @@ def test_buy_eval_records_mfe_mae_and_timing(memory_db, eval_settings):
     _put(bought_at + timedelta(hours=120),
          o=95.0, h=98.0, l=85.0, c=90.0)
     # 7d-later candle: open=close=high=low=110 (won't beat MFE/MAE extremes).
-    _put(bought_at + timedelta(days=7),
+    _put(bought_at + timedelta(days=7, hours=-1),
          o=110.0, h=110.0, l=110.0, c=110.0)
     # 30d-later candle for the existing return_30d_pct field.
-    _put(bought_at + timedelta(days=30),
+    _put(bought_at + timedelta(days=30, hours=-1),
          o=120.0, h=120.0, l=120.0, c=120.0)
+    _fill_hourly_window(
+        memory_db, symbol="BTCUSDT", start=bought_at,
+        end=bought_at + timedelta(days=7),
+    )
     memory_db.commit()
 
     now = bought_at + timedelta(days=31)
@@ -494,6 +516,238 @@ def test_buy_eval_mfe_mae_null_when_no_future_candles(memory_db, eval_settings):
     ).fetchone()
     assert row["max_gain_pct"] is None
     assert row["time_to_mfe_hours"] is None
+
+
+def test_incomplete_buy_evaluation_fills_late_data_and_then_skips(
+    memory_db, eval_settings
+):
+    bought_at = datetime(2026, 3, 1, 0, 0, tzinfo=UTC)
+    buy = insert_buy(
+        memory_db, symbol="BTCUSDT", bought_at=bought_at,
+        price=100.0, amount_invested=1000.0, now=bought_at,
+    )
+    _fill_hourly_window(
+        memory_db, symbol="BTCUSDT", start=bought_at,
+        end=bought_at + timedelta(days=1),
+    )
+    now = bought_at + timedelta(days=31)
+    first = evaluate_buy(memory_db, buy.id, eval_settings=eval_settings, now=now)
+    assert first is not None
+    assert first.day_open == 100.0
+    assert first.return_7d_pct is None
+    assert first.max_gain_pct is None
+
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT",
+        open_time=bought_at + timedelta(days=7, hours=-1), open_=108.0,
+    )
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT",
+        open_time=bought_at + timedelta(days=30, hours=-1), open_=110.0,
+    )
+    _fill_hourly_window(
+        memory_db, symbol="BTCUSDT", start=bought_at,
+        end=bought_at + timedelta(days=7),
+    )
+    report = evaluate_pending_buys(
+        memory_db, eval_settings=eval_settings, now=now + timedelta(hours=1)
+    )
+    assert (report.considered, report.evaluated, report.skipped_pending) == (1, 1, 0)
+    row = memory_db.execute(
+        "SELECT * FROM buy_evaluations WHERE buy_id = ?", (buy.id,)
+    ).fetchone()
+    assert row["return_7d_pct"] == pytest.approx(8.0)
+    assert row["return_30d_pct"] == pytest.approx(10.0)
+    assert row["max_gain_pct"] == pytest.approx(8.0)
+    assert row["max_loss_pct"] == 0.0
+    assert row["verdict"] == VERDICT_GOOD
+
+    report = evaluate_pending_buys(
+        memory_db, eval_settings=eval_settings, now=now + timedelta(hours=2)
+    )
+    assert (report.considered, report.evaluated, report.skipped_pending) == (0, 0, 0)
+    after = memory_db.execute(
+        "SELECT * FROM buy_evaluations WHERE buy_id = ?", (buy.id,)
+    ).fetchone()
+    assert dict(after) == dict(row)
+
+
+def test_buy_horizon_does_not_substitute_a_later_day(memory_db, eval_settings):
+    bought_at = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+    buy = insert_buy(
+        memory_db, symbol="BTCUSDT", bought_at=bought_at,
+        price=100.0, amount_invested=1000.0, now=bought_at,
+    )
+    # The +7d close is absent. Neither the next hour nor +30d may replace it.
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT",
+        open_time=bought_at + timedelta(days=7), open_=180.0,
+    )
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT",
+        open_time=bought_at + timedelta(days=30, hours=-1), open_=140.0,
+    )
+    now = bought_at + timedelta(days=31)
+    result = evaluate_buy(memory_db, buy.id, eval_settings=eval_settings, now=now)
+    assert result is not None
+    assert result.price_7d_later is None
+    assert result.return_7d_pct is None
+    assert result.price_30d_later == 140.0
+    assert result.verdict == VERDICT_PENDING
+
+    before = dict(memory_db.execute(
+        "SELECT * FROM buy_evaluations WHERE buy_id = ?", (buy.id,)
+    ).fetchone())
+    report = evaluate_pending_buys(
+        memory_db, eval_settings=eval_settings, now=now + timedelta(days=1)
+    )
+    assert (report.considered, report.evaluated, report.skipped_pending) == (1, 0, 0)
+    assert evaluate_buy(
+        memory_db, buy.id, eval_settings=eval_settings, now=now + timedelta(days=2)
+    ) is None
+    after = dict(memory_db.execute(
+        "SELECT * FROM buy_evaluations WHERE buy_id = ?", (buy.id,)
+    ).fetchone())
+    assert after == before
+
+
+def test_buy_partial_update_preserves_metrics_after_candles_are_pruned(
+    memory_db, eval_settings
+):
+    bought_at = datetime(2026, 3, 1, 0, 0, tzinfo=UTC)
+    buy = insert_buy(
+        memory_db, symbol="BTCUSDT", bought_at=bought_at,
+        price=100.0, amount_invested=1000.0, now=bought_at,
+    )
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT",
+        open_time=bought_at + timedelta(days=7, hours=-1), open_=108.0,
+    )
+    _fill_hourly_window(
+        memory_db, symbol="BTCUSDT", start=bought_at,
+        end=bought_at + timedelta(days=7),
+    )
+    now = bought_at + timedelta(days=31)
+    first = evaluate_buy(memory_db, buy.id, eval_settings=eval_settings, now=now)
+    assert first is not None
+    assert first.price_30d_later is None
+    assert first.verdict == VERDICT_GOOD
+
+    memory_db.execute("DELETE FROM candles")
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT",
+        open_time=bought_at + timedelta(days=30, hours=-1), open_=95.0,
+    )
+    second = evaluate_buy(
+        memory_db, buy.id, eval_settings=eval_settings, now=now + timedelta(hours=1)
+    )
+    assert second is not None
+    assert second.day_open == first.day_open
+    assert second.day_low_hourly == first.day_low_hourly
+    assert second.price_7d_later == first.price_7d_later
+    assert second.return_7d_pct == first.return_7d_pct
+    assert second.max_gain_pct == first.max_gain_pct
+    assert second.max_loss_pct == first.max_loss_pct
+    assert second.time_to_mfe_hours == first.time_to_mfe_hours
+    assert second.time_to_mae_hours == first.time_to_mae_hours
+    assert second.return_30d_pct == pytest.approx(-5.0)
+    assert second.verdict == VERDICT_GOOD
+
+
+def test_buy_mid_hour_excludes_purchase_candle_extremes(memory_db, eval_settings):
+    bought_at = datetime(2026, 3, 1, 12, 30, tzinfo=UTC)
+    buy = insert_buy(
+        memory_db, symbol="BTCUSDT", bought_at=bought_at,
+        price=100.0, amount_invested=1000.0, now=bought_at,
+    )
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT",
+        open_time=bought_at.replace(minute=0), open_=100.0,
+        high=200.0, low=50.0,
+    )
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT",
+        open_time=datetime(2026, 3, 1, 13, 0, tzinfo=UTC), open_=100.0,
+        high=110.0, low=95.0,
+    )
+    _fill_hourly_window(
+        memory_db, symbol="BTCUSDT", start=bought_at,
+        end=bought_at + timedelta(days=7),
+    )
+    # This bar crosses the end of the excursion window. Its close is the
+    # first hourly observation after +7d, but its extremes are outside it.
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT",
+        open_time=datetime(2026, 3, 8, 12, 0, tzinfo=UTC), open_=100.0,
+        high=300.0, low=10.0, close=108.0,
+    )
+    now = bought_at + timedelta(days=31)
+    result = evaluate_buy(memory_db, buy.id, eval_settings=eval_settings, now=now)
+    assert result is not None
+    assert result.max_gain_pct == pytest.approx(10.0)
+    assert result.max_loss_pct == pytest.approx(-5.0)
+    assert result.time_to_mfe_hours == 0.5
+    assert result.time_to_mae_hours == 0.5
+    assert result.return_7d_pct == pytest.approx(8.0)
+
+
+def test_buy_day_and_excursions_wait_for_missing_hour(memory_db, eval_settings):
+    bought_at = datetime(2026, 3, 1, 0, 0, tzinfo=UTC)
+    buy = insert_buy(
+        memory_db, symbol="BTCUSDT", bought_at=bought_at,
+        price=100.0, amount_invested=1000.0, now=bought_at,
+    )
+    _fill_hourly_window(
+        memory_db, symbol="BTCUSDT", start=bought_at,
+        end=bought_at + timedelta(days=7),
+    )
+    memory_db.execute("DELETE FROM candles WHERE open_time = '2026-03-01T06:00:00Z'")
+    now = bought_at + timedelta(days=31)
+    first = evaluate_buy(memory_db, buy.id, eval_settings=eval_settings, now=now)
+    assert first is not None
+    assert first.day_open is None
+    assert first.day_low_hourly is None
+    assert first.max_gain_pct is None
+    assert first.max_loss_pct is None
+    assert first.price_7d_later == 100.0
+
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT", open_time=bought_at + timedelta(hours=6),
+        open_=100.0, high=105.0, low=90.0,
+    )
+    second = evaluate_buy(
+        memory_db, buy.id, eval_settings=eval_settings, now=now + timedelta(hours=1)
+    )
+    assert second is not None
+    assert second.day_open == 100.0
+    assert second.day_low_hourly == 90.0
+    assert second.max_gain_pct == pytest.approx(5.0)
+    assert second.max_loss_pct == pytest.approx(-10.0)
+
+
+def test_buy_horizon_waits_for_hourly_close_when_now_is_mid_hour(
+    memory_db, eval_settings
+):
+    bought_at = datetime(2026, 3, 1, 12, 30, tzinfo=UTC)
+    buy = insert_buy(
+        memory_db, symbol="BTCUSDT", bought_at=bought_at,
+        price=100.0, amount_invested=1000.0, now=bought_at,
+    )
+    target = bought_at + timedelta(days=30)
+    _insert_candle_row(
+        memory_db, symbol="BTCUSDT", open_time=target.replace(minute=0),
+        open_=110.0,
+    )
+    first = evaluate_buy(memory_db, buy.id, eval_settings=eval_settings, now=target)
+    assert first is not None
+    assert first.price_30d_later is None
+    second = evaluate_buy(
+        memory_db, buy.id, eval_settings=eval_settings,
+        now=target + timedelta(minutes=30),
+    )
+    assert second is not None
+    assert second.price_30d_later == 110.0
+    assert second.return_30d_pct == pytest.approx(10.0)
 
 
 # ---------- Block 24: migration 005 idempotency ----------
