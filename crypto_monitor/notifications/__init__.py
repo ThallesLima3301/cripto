@@ -1,4 +1,4 @@
-"""Notification sending + alert policy + quiet-hours queue.
+"""Notification sending + alert policy + persistent buy-alert queue.
 
 The three pieces are deliberately separated so each is easy to test:
 
@@ -15,8 +15,8 @@ The three pieces are deliberately separated so each is easy to test:
   * `service` — the orchestrator that walks unalerted signal rows,
                 asks `policy` what to do, and executes the decision
                 via `ntfy` + writes to the DB. Also contains
-                `flush_queue`, which drains queued notifications once
-                quiet hours end.
+                `flush_queue`, which retries queued notifications
+                within age/attempt limits and honors quiet hours.
 
 Block 7 does NOT ship a "scan" entry point — wiring ingestion +
 scoring + notification together is the Block 10 scheduler's job.

@@ -7,23 +7,10 @@ decision:
   * `send_now`         — POST via `ntfy.send_ntfy`, then write a
                          notifications row with delivered=1 (on
                          success) or delivered=0+last_error (on
-                         failure). The signal is marked `alerted=1`
-                         either way so we do not retry automatically
-                         — a failing ntfy server would otherwise
-                         generate one send attempt per scan cycle.
-
-                         **v1 tradeoff**: because a send failure
-                         still flips `alerted=1`, a transient
-                         network outage during a scan will
-                         permanently suppress that specific signal
-                         on the phone. The row is still in the
-                         `signals` table and the failed notification
-                         is visible in the `notifications` table
-                         (with `last_error` set), so the user can
-                         inspect it — but we do not auto-replay. If
-                         that becomes painful we can add a
-                         short-window retry queue later without
-                         touching the policy layer.
+                         failure). Transient failures also set
+                         queued=1 for a later scan. The signal is
+                         marked `alerted=1` either way so processing
+                         it again cannot create a second queue row.
 
   * `queue`            — write a notifications row with delivered=0,
                          queued=1, sent_at=NULL. These rows are the
@@ -35,12 +22,13 @@ decision:
                          `alert_skipped_reason=cooldown:...` so the
                          row does not get re-examined on the next scan.
 
-`flush_queue` is the companion: when quiet hours end (or when the
-scheduler fires `flush` explicitly), it selects every notifications
-row with `delivered=0 AND queued=1`, checks that we're NOT currently
-in quiet hours, and sends each one. Successful rows are stamped with
-`sent_at`, `delivered=1`, `queued=0`. Failed rows keep `queued=1` so
-the next flush will try again.
+`flush_queue` runs at the start of every scan. It reuses queued rows,
+honors quiet hours except for very-strong alerts, and stops after five
+delivery cycles or 24 hours from queue creation. Successful rows are
+stamped with `sent_at`, `delivered=1`, `queued=0`. Only transient errors
+remain queued; permanent, expired and exhausted failures retain their
+diagnostic error as undelivered history. Historical queued=0 failures
+are not automatically replayed.
 
 Scoping note
 ------------
@@ -56,7 +44,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from crypto_monitor.config.settings import AlertSettings, NtfySettings
@@ -64,11 +52,7 @@ from crypto_monitor.notifications.formatters import (
     format_alert_body,
     format_alert_title,
 )
-from crypto_monitor.notifications.ntfy import (
-    REASON_SENT,
-    SendResult,
-    send_ntfy,
-)
+from crypto_monitor.notifications.ntfy import SendResult, send_ntfy
 from crypto_monitor.notifications.policy import (
     ACTION_QUEUE,
     ACTION_SEND_NOW,
@@ -88,6 +72,12 @@ from crypto_monitor.utils.time_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Bound delayed buy alerts so outages cannot trigger an unlimited
+# replay of obsolete market signals. One attempt is one sender call;
+# its HTTP retries are separately controlled by ntfy.max_retries.
+MAX_DELIVERY_ATTEMPTS = 5
+MAX_NOTIFICATION_AGE = timedelta(hours=24)
+
 
 # Signature for an injected ntfy sender — tests pass a stub that does
 # not touch the network. The default delegates to `send_ntfy`.
@@ -105,7 +95,10 @@ _PRIORITY_BY_SEVERITY: dict[str, str] = {
 
 @dataclass(frozen=True)
 class ProcessReport:
-    """Summary of a `process_pending_signals` run."""
+    """Run summary; queued includes failed sends deferred for retry.
+
+    A transient failure contributes to both queued and send_failed.
+    """
     considered: int
     sent: int
     queued: int
@@ -115,11 +108,16 @@ class ProcessReport:
 
 @dataclass(frozen=True)
 class FlushReport:
-    """Summary of a `flush_queue` run."""
+    """Run summary; considered counts sends actually attempted.
+
+    discarded counts rows removed undelivered, including failed
+    terminal attempts as well as expiry without a send.
+    """
     considered: int
     sent: int
     failed: int
     in_quiet_hours: bool
+    discarded: int = 0
 
 
 # ---------- main entry points ----------
@@ -132,13 +130,18 @@ def process_pending_signals(
     timezone_name: str,
     now: datetime | None = None,
     sender: NtfySender | None = None,
+    sent_clock: Callable[[], datetime] | None = None,
 ) -> ProcessReport:
     """Walk unalerted signals and dispatch each via the alert policy.
 
     `now` and `sender` are injectable for testing. In production
     `now` defaults to `now_utc()` and `sender` defaults to
-    `ntfy.send_ntfy`.
+    `ntfy.send_ntfy`. `sent_clock` is sampled after a successful send
+    to record server acknowledgement time. An explicit `now` freezes
+    that clock too unless the caller supplies one (deterministic replay).
     """
+    if sent_clock is None:
+        sent_clock = now_utc if now is None else lambda: now
     if now is None:
         now = now_utc()
     if sender is None:
@@ -228,7 +231,7 @@ def process_pending_signals(
                 priority=priority,
                 tags=tags,
                 created_at=now,
-                sent_at=now,
+                sent_at=max(now, sent_clock()),
                 bypass_quiet=decision.override_quiet_hours,
             )
             # Clean live-send: alert_skipped_reason stays NULL.
@@ -244,13 +247,17 @@ def process_pending_signals(
                 priority=priority,
                 tags=tags,
                 created_at=now,
-                bypass_quiet=decision.override_quiet_hours,
+                # Eligibility persists even if the first attempt was
+                # during the day and recovery happens at night.
+                bypass_quiet=facts.severity == "very_strong",
                 last_error=f"{result.reason}:{result.error or ''}",
+                retryable=result.retryable,
             )
             _mark_signal_alerted(
                 conn, facts.signal_id, f"send_failed:{result.reason}"
             )
             send_failed += 1
+            queued += int(result.retryable)
 
     conn.commit()
     return ProcessReport(
@@ -270,41 +277,60 @@ def flush_queue(
     timezone_name: str,
     now: datetime | None = None,
     sender: NtfySender | None = None,
+    sent_clock: Callable[[], datetime] | None = None,
 ) -> FlushReport:
-    """Drain pending queued notifications, unless we're in quiet hours.
+    """Retry queued buy alerts within their age and attempt limits.
 
     Returns a report including `in_quiet_hours` so the caller can
     distinguish "queue is empty" from "quiet hours are still active".
+    Very-strong alerts retain their quiet-hours bypass on retry.
     """
+    if sent_clock is None:
+        sent_clock = now_utc if now is None else lambda: now
     if now is None:
         now = now_utc()
     if sender is None:
         sender = send_ntfy
 
-    if is_quiet_hours(
+    in_quiet = is_quiet_hours(
         now,
         timezone_name,
         alerts.quiet_hours_start,
         alerts.quiet_hours_end,
-    ):
-        return FlushReport(
-            considered=0, sent=0, failed=0, in_quiet_hours=True
-        )
+    )
 
     rows = conn.execute(
         """
-        SELECT id, symbol, title, body, priority, tags
+        SELECT id, signal_id, symbol, title, body, priority, tags,
+               created_at, delivery_attempts, bypass_quiet, last_error
         FROM notifications
         WHERE delivered = 0 AND queued = 1
         ORDER BY created_at ASC, id ASC
         """
     ).fetchall()
 
-    considered = len(rows)
+    considered = 0
     sent = 0
     failed = 0
+    discarded = 0
 
     for row in rows:
+        stop_reason = None
+        if now - from_utc_iso(row["created_at"]) >= MAX_NOTIFICATION_AGE:
+            stop_reason = "retry_expired"
+        elif row["delivery_attempts"] >= MAX_DELIVERY_ATTEMPTS:
+            stop_reason = "retry_exhausted"
+        if stop_reason is not None:
+            conn.execute(
+                "UPDATE notifications SET queued = 0, last_error = ? WHERE id = ?",
+                (f"{stop_reason}:{row['last_error'] or ''}", row["id"]),
+            )
+            discarded += 1
+            continue
+        if in_quiet and not row["bypass_quiet"]:
+            continue
+
+        considered += 1
         tags_csv = row["tags"] or ""
         tags = tuple(t for t in tags_csv.split(",") if t)
         result = sender(
@@ -325,27 +351,43 @@ def flush_queue(
                     last_error = NULL
                 WHERE id = ?
                 """,
-                (to_utc_iso(now), row["id"]),
+                (to_utc_iso(max(now, sent_clock())), row["id"]),
+            )
+            conn.execute(
+                """
+                UPDATE signals SET alert_skipped_reason = NULL
+                WHERE id = ? AND alert_skipped_reason LIKE 'send_failed:%'
+                """,
+                (row["signal_id"],),
             )
             sent += 1
         else:
+            retry = result.retryable and (
+                row["delivery_attempts"] + 1 < MAX_DELIVERY_ATTEMPTS
+            )
+            error = f"{result.reason}:{result.error or ''}"
+            if result.retryable and not retry:
+                error = f"retry_exhausted:{error}"
             conn.execute(
                 """
                 UPDATE notifications
-                SET delivery_attempts = delivery_attempts + 1,
+                SET queued = ?,
+                    delivery_attempts = delivery_attempts + 1,
                     last_error = ?
                 WHERE id = ?
                 """,
-                (f"{result.reason}:{result.error or ''}", row["id"]),
+                (int(retry), error, row["id"]),
             )
             failed += 1
+            discarded += int(not retry)
 
     conn.commit()
     return FlushReport(
         considered=considered,
         sent=sent,
         failed=failed,
-        in_quiet_hours=False,
+        in_quiet_hours=in_quiet,
+        discarded=discarded,
     )
 
 
@@ -494,6 +536,7 @@ def _insert_failed_notification(
     created_at: datetime,
     bypass_quiet: bool,
     last_error: str,
+    retryable: bool,
 ) -> int:
     cur = conn.execute(
         """
@@ -504,7 +547,7 @@ def _insert_failed_notification(
         ) VALUES (
             ?, NULL, ?, ?,
             ?, ?, ?, ?,
-            0, ?, 0, 1, ?
+            ?, ?, 0, 1, ?
         )
         """,
         (
@@ -515,6 +558,7 @@ def _insert_failed_notification(
             body,
             priority,
             ",".join(tags),
+            int(retryable),
             1 if bypass_quiet else 0,
             last_error,
         ),

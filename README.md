@@ -209,6 +209,22 @@ alert.
 - Quiet-hours queue: alerts produced inside the configured local
   window are written with `queued=1` and flushed on the next
   post-quiet scan; `very_strong` bypasses and sends immediately.
+- Failed buy-alert sends join the same persistent queue when the
+  cause is temporary (network, HTTP 408/429/5xx or missing HTTP status).
+  Each later scan retries the existing row, with at most **5 delivery
+  cycles total** and a **24-hour queue lifetime**. Each cycle may also
+  use the HTTP retries configured in `[ntfy].max_retries`; HTTP 408/429
+  wait for a later scan instead of retrying immediately. Very-strong
+  retries bypass quiet hours even if the original failure was daytime.
+- Missing-topic and other permanent HTTP failures stop automatic
+  delivery. Expired/exhausted rows stay in `notifications` with
+  `delivered=0`, `queued=0`, and a diagnostic `last_error`. Historical
+  failures already stored with `queued=0` are not replayed. This queue
+  covers buy-signal alerts; sell alerts and weekly reports use their
+  existing separate delivery paths.
+- Scan logs show `flushed`, `flush_failed`, and `flush_discarded`.
+  `queued` counts new quiet-hour deferrals plus transient failures;
+  such failures also count toward `failed`.
 - Sell signals use a dedicated formatter so the buy-side
   notification UX is unaffected. Non-ASCII titles (e.g. the weekly
   em-dash, sell-side accented Portuguese) are RFC-2047 encoded
@@ -270,7 +286,12 @@ public surface:
 Every cross-layer call is dependency-injected (settings, DB
 connection, ntfy sender, clock) so the orchestrators are
 exhaustively tested against in-memory SQLite without touching the
-network. The main test suite has **666 tests**.
+network. The main test suite has **808 tests**.
+
+Install `pip install -e ".[dev,dashboard]"` and run `python -m pytest -q`
+to include the dashboard API tests, including simultaneous requests
+against a temporary SQLite database. Dashboard tests skip when the
+optional FastAPI dependency is absent.
 
 ---
 
@@ -454,6 +475,81 @@ when at least 5 matured rows exist in the window, and a `Análise:
 dados insuficientes` line otherwise — the section header always
 appears so users notice the feature.
 
+### Simulated portfolio
+
+`paper simulate` replays **recorded signals** against closed hourly
+candles. It reports net profit, hourly portfolio drawdown (including
+open positions), closed-trade win rate, paid fees, and a buy-and-hold
+comparison. It opens the database **read-only**, without migrations,
+orders, notifications, or changes to manual buy/sell records.
+
+Example using an existing local database (choose dates with complete
+hourly coverage):
+
+```powershell
+python -m crypto_monitor.cli paper simulate --db data/crypto_monitor.db --from 2026-04-01T17:00:00Z --until 2026-04-26T13:00:00Z
+```
+
+The assumptions are explicit and configurable:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--capital` | `10000` | Hypothetical initial USDT; cash earns no interest. |
+| `--position-pct` | `20` | Fixed percentage of **initial** capital per purchase, entry fee included. |
+| `--max-positions` | `5` | Simultaneous positions; at most one per symbol, no borrowing. |
+| `--holding-hours` | `168` | Sell at the hourly close exactly this many hours after entry. |
+| `--fee-bps` | `10` | Illustrative fee per side: 10 basis points = 0.10%. |
+| `--slippage-bps` | `5` | Adverse execution difference per side: 5 basis points = 0.05%. |
+| `--min-score` | `50` | Filter on the score originally recorded for the signal. |
+| `--benchmark` | `BTCUSDT` | Buy at the window's first open and sell at its last close, using the same capital and costs. |
+| `--signal-source` | `delivered` | Use the first recorded successful notification; `detected` ignores notification delivery for research. |
+
+Entry occurs at the **strictly next hourly opening** after the latest
+of signal detection, the signal candle's close, and the recorded send
+time. An alert recorded at 15:00 or 15:07 therefore enters at 16:00.
+This is an execution assumption, not proof a real order would fill.
+Old notifications can contain the start of the scan/batch instead of
+the send acknowledgement time; historical entries may consequently be
+too early. New live scans now record the clock **after** a successful
+send. Server acknowledgement still does not prove receipt on a phone.
+
+Purchases include entry fees in the allocated budget; sales subtract
+both slippage and fees. Insufficient cash or occupied slots skip that
+signal with an explicit reason. Exits release cash before entries at
+the same boundary. Positions whose holding period ends after `--until`
+remain open and are valued at the final close **after estimated sale
+costs**, rather than being counted as completed profitable trades.
+`fees_paid` excludes those hypothetical future exit fees, while ending
+equity includes their estimated effect.
+
+The window is `[--from, --until)` in complete UTC hours. Candles must
+already be closed. Missing entry, held-position, or benchmark candles
+abort the report instead of silently dropping an unfavorable trade.
+This matters because retention can prune candles while retaining signals.
+The simulator does not regenerate old signals from today's scoring rules.
+
+Add `--json` for the full trade ledger, assumptions, skipped-signal
+counts, and equity curve. Rerun with a later `--until` to include newly
+recorded alerts; there is no automatic paper account running in the
+background. Save reports before source candles are pruned:
+
+```powershell
+python -m crypto_monitor.cli paper simulate --db data/crypto_monitor.db --from 2026-04-01T17:00:00Z --until 2026-04-26T13:00:00Z --json | Set-Content -Encoding utf8 data/paper-result.json
+```
+
+`--validation-from <UTC-hour>` splits the requested window into two
+separate simulations with the **same assumptions and reset capital**.
+Positions do not carry across that boundary. Choose rules on the earlier
+period, then keep them fixed for the later period; merely splitting
+already-inspected data does not create independent validation.
+
+Costs are configurable hypotheses, not fetched exchange fees. Taxes,
+liquidity limits, lot sizes and order-size market impact are not modeled.
+Drawdown samples hourly opens/closes, so intrahour losses can be larger.
+The report flags fewer than 30 closed trades as a small sample; reaching
+30 is not evidence of an edge. Net results and benchmark differences
+are hypothetical and do not establish future profitability.
+
 ---
 
 ## Notifications
@@ -526,6 +622,12 @@ WAL mode lets the bot scan and the API read concurrently. If a scan
 briefly locks the DB the API returns 503; the dashboard's frontend
 retries cleanly on the next poll.
 
+Each API request opens its own SQLite connection and closes it even
+if the handler fails. That connection can move between FastAPI worker
+threads during dependency setup, queries, and cleanup, but is never
+shared between requests. Bot and CLI connections keep SQLite's default
+thread-affinity check.
+
 ### Next.js frontend (`dashboard/`)
 
 Six read-only pages, all consuming the FastAPI adapter via TanStack
@@ -576,6 +678,7 @@ runtime error, `2` on argparse usage error.
 | `sell list` | Print rows from `sell_signals`. `--symbol`, `--rule`, `--limit`. |
 | `watchlist list` | Print active `status='watching'` rows. |
 | `analytics summary` | Print the expectancy report. `--scope all\|90d\|30d` (default `all`), `--min-signals N` (default 5). |
+| `paper simulate` | Read-only portfolio replay with fees, slippage, capital limits, drawdown and buy-and-hold comparison. Requires `--from` and `--until`; optional `--db`, `--json`, `--validation-from`. |
 | `ntfy-test` | Send a one-shot test notification. `--title`, `--body`. |
 
 `buy add` arguments:
@@ -837,6 +940,9 @@ rm crypto_monitor.db crypto_monitor.db.enc
   always manual.
 - **GitHub Actions schedule jitter.** 5–20 minute jitter on the free
   tier; cadence is approximate, not real-time.
+- **Notification delivery is not exactly-once.** If ntfy accepts a
+  POST but its response is lost, retrying can produce a duplicate.
+  Buy-alert retries are bounded by the five-cycle/24-hour limits.
 - **Hourly resolution.** Every price calculation is bounded by 1h
   candles. Intraday moves between candle closes are invisible.
 - **Analytics need history.** With a 30-day maturation window, a
@@ -874,9 +980,10 @@ Explicitly **not** implemented today:
   multi-tenant or hosted serverless deployment. The reader/writer
   split is already centralized in the per-domain `*/store.py`
   modules, so dialect changes would be localized.
-- **Paper trading.** A simulated-fills layer that scores hypothetical
-  strategies against historical candles, feeding back into the
-  analytics aggregator.
+- **Historical signal regeneration and automatic paper account.** The
+  current `paper simulate` replays recorded signals on demand. Rebuilding
+  signals across historical strategies and maintaining a persistent
+  simulated account during scans remain separate future work.
 - **Exchange execution layer.** Broker-API integration would be
   opt-in, isolated behind a feature flag, and only built if the
   manual flow proves consistently profitable.
@@ -901,6 +1008,7 @@ crypto_monitor/
 │                     bullish-divergence, volume
 ├── ingestion/        per-symbol incremental candle ingest
 ├── notifications/    ntfy sender (RFC-2047), policy, queue, formatters
+├── paper/            read-only signal replay, cost model, portfolio and benchmark
 ├── regime/           BTC EMA + ATR percentile classifier + snapshot store
 ├── reports/          weekly summary generation + persistence + send
 ├── scheduler/        run_scan / run_maintenance / run_weekly orchestrators
@@ -942,7 +1050,7 @@ scripts/
 ├── maintenance.yml
 ├── weekly.yml
 └── buy-add.yml
-tests/                   pytest suite (666 tests against in-memory SQLite)
+tests/                   pytest suite (808 tests using in-memory or temporary SQLite)
 ```
 
 `data\` and `logs\` are created on demand. Both, plus `.env` and
@@ -990,11 +1098,15 @@ design.** `very_strong` signals **bypass** quiet hours; raise
 
 ### Failed notifications
 
-`notifications.delivered = 0` and `notifications.last_error` is set;
-`scan` reports `failed=N`. Look at `logs\scan.cmd.log` for the
-status code from the retry attempts. 4xx from ntfy usually means a
-typo in the topic; 5xx / network failures retry with exponential
-backoff up to `[ntfy].max_retries` and stay queued.
+For buy alerts, `notifications.delivered = 0` with `queued=1` means
+delivery is still pending. `last_error` records the last failure.
+`scan` reports initial failures as `failed=N` and later queue failures
+as `flush_failed=N`; `flushed=N` counts successful queued deliveries.
+Network/5xx errors use `[ntfy].max_retries` within each delivery cycle.
+HTTP 408/429 wait for a later scan. The persistent queue stops after
+5 delivery cycles or 24 hours, or immediately on a permanent error
+such as HTTP 403 or a missing topic. Stopped rows retain `last_error`
+and have `queued=0`; `flush_discarded=N` reports these queue removals.
 
 ### Dashboard can't reach the API
 

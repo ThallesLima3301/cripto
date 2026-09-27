@@ -120,7 +120,7 @@ _CREATE_STATEMENTS: tuple[str, ...] = (
     """,
 
     # Notifications. This table also serves as the pending-delivery queue
-    # for quiet-hour alerts (Phase 1 point 8): rows with delivered=0 AND
+    # for quiet-hour alerts and transient send failures: delivered=0 AND
     # queued=1 are the outstanding queue, rows with delivered=1 are
     # history. A single table is sufficient for v1 volume.
     """

@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Iterator
 
 
-def get_connection(db_path: Path | str) -> sqlite3.Connection:
+def get_connection(
+    db_path: Path | str, *, check_same_thread: bool = True
+) -> sqlite3.Connection:
     """Open a SQLite connection with the project's required PRAGMAs applied.
 
     `db_path` may be a filesystem path or the string ':memory:' for tests.
@@ -30,6 +32,11 @@ def get_connection(db_path: Path | str) -> sqlite3.Connection:
 
     WAL mode is a no-op for in-memory databases; the PRAGMA still returns
     successfully, just with 'memory' as the reported mode.
+
+    Thread affinity is enforced by default. Request-scoped adapters may
+    disable it when work moves between worker threads, but must still
+    ensure each connection is used sequentially and is never shared
+    between requests.
     """
     path_str = str(db_path)
     if path_str != ":memory:":
@@ -39,6 +46,7 @@ def get_connection(db_path: Path | str) -> sqlite3.Connection:
         path_str,
         timeout=5.0,
         detect_types=sqlite3.PARSE_DECLTYPES,
+        check_same_thread=check_same_thread,
     )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")

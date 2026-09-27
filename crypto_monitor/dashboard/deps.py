@@ -17,8 +17,7 @@ from crypto_monitor.database.connection import get_connection
 
 # Project root used to resolve config + DB paths. Production hosts can
 # override via env (``CRYPTO_MONITOR_PROJECT_ROOT``) without changing
-# code; tests inject their own Settings directly via
-# ``app.dependency_overrides``.
+# code; tests replace settings resolution with a temporary DB path.
 def _resolve_project_root() -> Path:
     import os
     raw = os.environ.get("CRYPTO_MONITOR_PROJECT_ROOT")
@@ -45,14 +44,17 @@ def get_db(settings: Settings = None) -> Iterator[sqlite3.Connection]:  # type: 
     while a scheduler-driven scan writes. Closed in ``finally`` even
     on exceptions.
 
-    The signature accepts ``settings`` as a defaulted argument so
-    tests can override it via ``app.dependency_overrides[get_db]``
-    without also having to override settings; production code paths
-    pull settings from :func:`get_settings`.
+    FastAPI may run dependency setup, the synchronous handler, and
+    cleanup on different worker threads. Allow that handoff while
+    keeping one connection per request, used sequentially by its
+    handler and never shared with another request.
+
+    If no settings instance is provided, resolve the cached settings
+    from :func:`get_settings`.
     """
     if settings is None:
         settings = get_settings()
-    conn = get_connection(settings.general.db_path)
+    conn = get_connection(settings.general.db_path, check_same_thread=False)
     try:
         yield conn
     finally:

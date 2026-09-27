@@ -9,11 +9,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from crypto_monitor.notifications.ntfy import (
     REASON_HTTP_ERROR,
     REASON_MISSING_TOPIC,
     REASON_NETWORK_ERROR,
     REASON_SENT,
+    SendResult,
     send_ntfy,
 )
 
@@ -49,6 +52,53 @@ class RecordingPost:
 
 def _no_sleep(_: float) -> None:
     return None
+
+
+# ---------- durable retry classification ----------
+
+@pytest.mark.parametrize(
+    ("result", "retryable"),
+    [
+        pytest.param(
+            SendResult(False, REASON_NETWORK_ERROR), True, id="network-error"
+        ),
+        pytest.param(
+            SendResult(False, REASON_HTTP_ERROR, None), True, id="unknown-status"
+        ),
+        pytest.param(
+            SendResult(False, REASON_HTTP_ERROR, 408), True, id="request-timeout"
+        ),
+        pytest.param(
+            SendResult(False, REASON_HTTP_ERROR, 429), True, id="rate-limited"
+        ),
+        pytest.param(
+            SendResult(False, REASON_HTTP_ERROR, 500), True, id="server-error"
+        ),
+        pytest.param(
+            SendResult(False, REASON_HTTP_ERROR, 599), True, id="last-server-error"
+        ),
+        pytest.param(
+            SendResult(True, REASON_SENT, 200), False, id="already-delivered"
+        ),
+        pytest.param(
+            SendResult(False, REASON_MISSING_TOPIC), False, id="missing-topic"
+        ),
+        pytest.param(
+            SendResult(False, REASON_HTTP_ERROR, 403), False, id="forbidden"
+        ),
+        pytest.param(
+            SendResult(False, REASON_HTTP_ERROR, 302), False, id="redirect"
+        ),
+        pytest.param(
+            SendResult(False, REASON_HTTP_ERROR, 600), False, id="invalid-status"
+        ),
+        pytest.param(
+            SendResult(False, "unknown"), False, id="unknown-reason"
+        ),
+    ],
+)
+def test_send_result_classifies_durable_retry(result, retryable):
+    assert result.retryable is retryable
 
 
 # ---------- missing topic ----------
@@ -122,6 +172,26 @@ def test_4xx_is_permanent_error_no_retry(ntfy_settings):
     assert result.status_code == 403
     # 4xx must not trigger a retry.
     assert len(post.calls) == 1
+
+
+@pytest.mark.parametrize("status", [408, 429])
+def test_transient_4xx_defers_retry_to_later_scan(ntfy_settings, status):
+    post = RecordingPost([FakeResponse(status), FakeResponse(200)])
+    sleeps: list[float] = []
+    result = send_ntfy(
+        ntfy_settings,
+        "t",
+        "b",
+        http_post=post,
+        sleeper=sleeps.append,
+    )
+
+    assert result.sent is False
+    assert result.reason == REASON_HTTP_ERROR
+    assert result.status_code == status
+    assert result.retryable is True
+    assert len(post.calls) == 1
+    assert sleeps == []
 
 
 def test_5xx_retries_then_succeeds(ntfy_settings):

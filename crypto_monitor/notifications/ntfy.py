@@ -18,10 +18,10 @@ Design notes
   import graph for pure-policy tests.
 
 * Retries use an injected `sleeper` callable (defaults to
-  `time.sleep`). Tests pass a no-op. Retries are limited to network
-  errors and 5xx responses — 4xx responses are a permanent error and
-  we return immediately so we don't spam ntfy with a request it has
-  already rejected.
+  `time.sleep`). Tests pass a no-op. Network errors and 5xx responses
+  are retried immediately. HTTP 408/429 return promptly so the buy
+  notification queue can try again on a later scan; other 4xx errors
+  are terminal.
 
 * Backoff is **exponential**: 1s, 2s, 4s, 8s between successive
   retries. `max_retries` in config caps the number of *additional*
@@ -62,6 +62,19 @@ class SendResult:
     reason: str
     status_code: int | None = None
     error: str | None = None
+
+    @property
+    def retryable(self) -> bool:
+        """Whether a later delivery cycle may recover this failure."""
+        if self.sent:
+            return False
+        if self.reason == REASON_NETWORK_ERROR:
+            return True
+        return self.reason == REASON_HTTP_ERROR and (
+            self.status_code is None
+            or self.status_code in (408, 429)
+            or 500 <= self.status_code < 600
+        )
 
 
 # Type alias for the injected HTTP POST callable. It must accept
@@ -157,8 +170,9 @@ def send_ntfy(
         if status is not None and 200 <= status < 300:
             return SendResult(sent=True, reason=REASON_SENT, status_code=status)
 
-        # 4xx = permanent error, do not retry.
-        if status is not None and 400 <= status < 500:
+        # 408/429 are deferred to the durable buy-alert queue. Other
+        # known non-5xx failures are terminal; no tight-loop retry.
+        if status is not None and not 500 <= status < 600:
             return SendResult(
                 sent=False,
                 reason=REASON_HTTP_ERROR,

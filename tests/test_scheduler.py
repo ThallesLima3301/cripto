@@ -323,6 +323,77 @@ def test_run_scan_orchestrates_full_pipeline(
     assert report.errors == []
 
 
+def test_run_scan_recovers_failed_alert_without_creating_another_notification(
+    memory_db, tmp_path, scoring_settings, alerts_settings,
+    ntfy_settings, eval_settings,
+):
+    settings = _make_settings(
+        tmp_path,
+        scoring_settings=scoring_settings,
+        alerts_settings=alerts_settings,
+        ntfy_settings=ntfy_settings,
+        eval_settings=eval_settings,
+        tracked=(),
+        auto_seed=False,
+    )
+    now = datetime(2026, 4, 11, 15, 0, tzinfo=UTC)
+    _insert_pending_signal(memory_db, detected_at=now)
+    kwargs = dict(settings=settings, conn=memory_db, client=_StubBinanceClient())
+    failing = _RecordingSender(
+        SendResult(sent=False, reason=REASON_NETWORK_ERROR, error="offline")
+    )
+    first = run_scan(**kwargs, now=now, sender=failing)
+    assert first.process_report.send_failed == first.process_report.queued == 1
+    assert len(failing.calls) == 1
+    original = memory_db.execute("SELECT id FROM notifications").fetchone()[0]
+
+    second = run_scan(**kwargs, now=now + timedelta(minutes=5), sender=failing)
+    assert second.flush_report.failed == 1
+    assert second.process_report.considered == 0
+    assert "flush_failed=1" in second.summary_line()
+    assert len(failing.calls) == 2
+
+    recovered = _RecordingSender(SendResult(sent=True, reason=REASON_SENT))
+    third = run_scan(**kwargs, now=now + timedelta(minutes=10), sender=recovered)
+    assert third.flush_report.sent == 1
+    assert third.process_report.considered == 0
+    assert "flushed=1" in third.summary_line()
+    rows = memory_db.execute(
+        "SELECT id, delivered, queued, delivery_attempts FROM notifications"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(original, 1, 0, 3)]
+
+    fourth = run_scan(**kwargs, now=now + timedelta(minutes=15), sender=recovered)
+    assert fourth.flush_report.considered == fourth.process_report.considered == 0
+    assert len(recovered.calls) == 1
+    assert all(not report.errors for report in (first, second, third, fourth))
+
+
+def test_real_scan_records_send_acknowledgement_not_scan_start(
+    memory_db, tmp_path, scoring_settings, alerts_settings,
+    ntfy_settings, eval_settings, monkeypatch,
+):
+    from crypto_monitor.scheduler import entrypoints
+
+    settings = _make_settings(
+        tmp_path, scoring_settings=scoring_settings, alerts_settings=alerts_settings,
+        ntfy_settings=ntfy_settings, eval_settings=eval_settings,
+        tracked=(), auto_seed=False,
+    )
+    start = datetime(2026, 4, 11, 18, 59, tzinfo=UTC)
+    response_at = start + timedelta(minutes=2)
+    _insert_pending_signal(memory_db, detected_at=start)
+    clock_values = iter((start, response_at))
+    monkeypatch.setattr(entrypoints, "now_utc", lambda: next(clock_values))
+    report = run_scan(
+        settings=settings, conn=memory_db, client=_StubBinanceClient(),
+        sender=_RecordingSender(SendResult(True, REASON_SENT)),
+    )
+    assert report.errors == []
+    assert report.process_report.sent == 1
+    assert memory_db.execute("SELECT sent_at FROM notifications").fetchone()[0] == _iso(response_at)
+
+
 def test_run_scan_without_auto_seed_does_not_touch_symbols_table(
     memory_db,
     tmp_path,

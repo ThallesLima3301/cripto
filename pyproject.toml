@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<10",
+    "httpx>=0.27,<1",  # TestClient and concurrent dashboard API tests
 ]
 # Read-only dashboard API. Optional because the bot itself never
 # imports anything from `crypto_monitor.dashboard`; only the operator

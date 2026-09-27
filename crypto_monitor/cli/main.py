@@ -25,12 +25,13 @@ in-process hooks or globals are needed.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import shutil
 import sqlite3
 import sys
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Sequence
 
@@ -244,6 +245,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=5,
         help="Minimum rows for a sliced bucket to appear (default: 5).",
     )
+
+    # paper ---------------------------------------------------------------
+    paper_p = sub.add_parser("paper", help="Simulate a portfolio from recorded signals (read-only).")
+    paper_sub = paper_p.add_subparsers(dest="paper_command", required=True)
+    paper_sim = paper_sub.add_parser("simulate", help="Compare net results with buy-and-hold.")
+    paper_sim.add_argument("--from", dest="start", required=True, help="Start UTC hour, e.g. 2026-08-01T00:00:00Z.")
+    paper_sim.add_argument("--until", dest="end", required=True, help="Exclusive end UTC hour; must be in the past.")
+    paper_sim.add_argument("--db", type=Path, help="Existing SQLite path; bypasses project configuration.")
+    paper_sim.add_argument("--capital", type=float, default=10_000.0, help="Initial simulated USDT (default: 10000).")
+    paper_sim.add_argument("--position-pct", type=float, default=20.0, help="Initial capital allocated per purchase, including entry fee (default: 20).")
+    paper_sim.add_argument("--max-positions", type=int, default=5, help="Simultaneously open positions (default: 5).")
+    paper_sim.add_argument("--holding-hours", type=int, default=168, help="Fixed holding period in hours (default: 168).")
+    paper_sim.add_argument("--fee-bps", type=float, default=10.0, help="Illustrative fee per side in basis points (default: 10).")
+    paper_sim.add_argument("--slippage-bps", type=float, default=5.0, help="Adverse execution difference per side in basis points (default: 5).")
+    paper_sim.add_argument("--min-score", type=float, default=50.0, help="Minimum recorded signal score (default: 50).")
+    paper_sim.add_argument("--benchmark", default="BTCUSDT", help="USDT pair to buy and hold (default: BTCUSDT).")
+    paper_sim.add_argument("--signal-source", choices=("delivered", "detected"), default="delivered", help="delivered uses first recorded successful send; detected is research only.")
+    paper_sim.add_argument("--validation-from", help="UTC hour splitting two independent portfolios with identical settings and reset capital.")
+    paper_sim.add_argument("--json", action="store_true", help="Output full report, trade ledger and equity curve as JSON.")
 
     # watchlist -----------------------------------------------------------
     watchlist_p = sub.add_parser(
@@ -714,6 +734,69 @@ def _cmd_analytics_summary(args: argparse.Namespace, ctx: _Context) -> int:
     return 0
 
 
+# ---------- paper ----------
+
+
+def _paper_hour(value: str, option: str) -> datetime:
+    try:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{option}: informe uma data ISO-8601 com fuso, como 2026-08-01T00:00:00Z") from exc
+    if result.tzinfo is None:
+        raise ValueError(f"{option}: informe o fuso UTC usando Z ou +00:00")
+    result = result.astimezone(timezone.utc)
+    if result.minute or result.second or result.microsecond:
+        raise ValueError(f"{option}: use uma hora UTC completa, sem minutos ou segundos")
+    return result
+
+
+def _cmd_paper(args: argparse.Namespace, ctx: _Context) -> int:
+    # Keep this optional analysis path independent from scanner startup.
+    from crypto_monitor.paper.reporter import format_simulation_report
+    from crypto_monitor.paper.service import simulate_database
+    from crypto_monitor.paper.types import SimulationConfig
+
+    start, end = _paper_hour(args.start, "--from"), _paper_hour(args.end, "--until")
+    as_of = now_utc()
+    if start >= end:
+        raise ValueError("--from deve ser anterior a --until")
+    if end > as_of:
+        raise ValueError("--until não pode estar no futuro: use apenas candles já fechados")
+    split = _paper_hour(args.validation_from, "--validation-from") if args.validation_from else None
+    if split is not None and not start < split < end:
+        raise ValueError("--validation-from deve estar entre --from e --until")
+    config = SimulationConfig(
+        initial_capital=args.capital,
+        position_pct=args.position_pct,
+        max_positions=args.max_positions,
+        holding_hours=args.holding_hours,
+        fee_bps=args.fee_bps,
+        slippage_bps=args.slippage_bps,
+        min_score=args.min_score,
+        benchmark_symbol=args.benchmark.upper(),
+        signal_source=args.signal_source,
+    )
+    db_path = args.db if args.db is not None else load_settings(ctx.project_root).general.db_path
+    if split is None:
+        report = simulate_database(db_path, config, start=start, end=end, as_of=as_of)
+        ctx.out(json.dumps(asdict(report), ensure_ascii=False, indent=2, allow_nan=False) if args.json else format_simulation_report(report))
+    else:
+        development = simulate_database(db_path, config, start=start, end=split, as_of=as_of)
+        validation = simulate_database(db_path, config, start=split, end=end, as_of=as_of)
+        note = (
+            "Divisão cronológica com parâmetros iguais e capital reiniciado; posições não passam "
+            "de um período ao outro. Só trate o segundo período como validação se as regras "
+            "foram escolhidas antes de observar seus resultados. A divisão não prova lucro futuro."
+        )
+        if args.json:
+            ctx.out(json.dumps({"development": asdict(development), "validation": asdict(validation), "validation_note": note}, ensure_ascii=False, indent=2, allow_nan=False))
+        else:
+            ctx.out("PERÍODO INICIAL\n" + format_simulation_report(development))
+            ctx.out("\nPERÍODO POSTERIOR\n" + format_simulation_report(validation))
+            ctx.out("\n" + note)
+    return 0
+
+
 # ---------- watchlist ----------
 
 def _cmd_watchlist(args: argparse.Namespace, ctx: _Context) -> int:
@@ -802,5 +885,6 @@ _HANDLERS = {
     "signals": _cmd_signals,
     "watchlist": _cmd_watchlist,
     "analytics": _cmd_analytics,
+    "paper": _cmd_paper,
     "ntfy-test": _cmd_ntfy_test,
 }

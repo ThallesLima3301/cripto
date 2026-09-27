@@ -151,6 +151,13 @@ class ScanReport:
         failed = (
             self.process_report.send_failed if self.process_report else 0
         )
+        flush = self.flush_report
+        flush_part = (
+            f" flushed={flush.sent} flush_failed={flush.failed} "
+            f"flush_discarded={flush.discarded}"
+            if flush is not None
+            else ""
+        )
         sell = self.sell_report
         sell_part = (
             f" sell_emitted={sell.signals_emitted} sell_sent={sell.signals_sent} "
@@ -169,7 +176,7 @@ class ScanReport:
             f"scan ingest={ingest_total} scored={self.scored_symbols} "
             f"inserted={self.inserted_signals} "
             f"sent={processed} queued={queued} "
-            f"cooldown={cd} failed={failed}{sell_part}{wl_part} "
+            f"cooldown={cd} failed={failed}{flush_part}{sell_part}{wl_part} "
             f"errors={len(self.errors)}"
         )
 
@@ -237,6 +244,9 @@ def run_scan(
     only if no settings can be resolved.
     """
     settings = _resolve_settings(project_root, settings)
+    # Real sends may occur minutes after scan startup. Preserve the
+    # response timestamp; an injected scan time keeps replay deterministic.
+    sent_clock = now_utc if now is None else lambda: now
     if now is None:
         now = now_utc()
 
@@ -273,6 +283,7 @@ def run_scan(
                 timezone_name=settings.general.timezone,
                 now=now,
                 sender=sender,
+                sent_clock=sent_clock,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("flush_queue failed")
@@ -377,6 +388,7 @@ def run_scan(
                 timezone_name=settings.general.timezone,
                 now=now,
                 sender=sender,
+                sent_clock=sent_clock,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("process_pending_signals failed")

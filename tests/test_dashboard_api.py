@@ -1,22 +1,18 @@
-"""Tests for the dashboard read-only API (Step 1).
+"""Tests for the dashboard read-only API using temporary SQLite databases.
 
-Two endpoints in scope:
-
-  * ``/api/health``    — DB liveness + schema_version + freshness.
-  * ``/api/overview``  — KPIs + regime + analytics digest + activity feed.
-
-The tests drive the FastAPI app via ``fastapi.testclient.TestClient``
-(which uses httpx under the hood — already installed transitively).
-The DB connection dependency is overridden to point at the shared
-``seed_conn`` fixture from ``conftest.py`` so the tests never touch
-disk.
+Requests exercise the production connection dependency. Only settings
+resolution is replaced so no test reads the operator's configuration or DB.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,12 +21,14 @@ import pytest
 # `scan` GHA workflow, which only installs `requirements.txt` for the
 # bot's runtime dependencies — pytest must SKIP this entire module
 # instead of failing collection. Locally (and in any CI that installs
-# the extra), all 12 tests run normally.
+# the dashboard test dependencies), all tests run normally.
 pytest.importorskip("fastapi")
 
+import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from crypto_monitor.dashboard import api as dashboard_api  # noqa: E402
+from crypto_monitor.dashboard import deps as dashboard_deps  # noqa: E402
 from crypto_monitor.dashboard.api import app  # noqa: E402
 from crypto_monitor.dashboard.deps import get_db  # noqa: E402
 from crypto_monitor.database.connection import get_connection  # noqa: E402
@@ -47,11 +45,8 @@ UTC = timezone.utc
 def db_path(tmp_path: Path) -> Path:
     """A temp-file SQLite database with the full schema applied.
 
-    A file (not ``:memory:``) is required because TestClient runs the
-    request handler on a worker thread, and sqlite3 connections are
-    thread-bound by default. The file lets the per-request dependency
-    override open its own connection on the request's own thread —
-    exactly how production behaves.
+    Separate connections for seeding and HTTP requests all see the same
+    database. Each request retains its own connection throughout its life.
     """
     p = tmp_path / "dashboard.db"
     conn = get_connection(p)
@@ -74,21 +69,105 @@ def seed_conn(db_path: Path):
 
 
 @pytest.fixture
-def client(db_path: Path):
-    """A TestClient that opens a fresh connection per request."""
+def dashboard_settings(db_path: Path, monkeypatch):
+    """Point the real dependency at the isolated test database."""
+    settings = SimpleNamespace(general=SimpleNamespace(db_path=db_path))
+    monkeypatch.setattr(dashboard_deps, "get_settings", lambda: settings)
+    return settings
 
-    def _gen():
-        conn = get_connection(db_path)
-        try:
-            yield conn
-        finally:
-            conn.close()
 
-    app.dependency_overrides[get_db] = _gen
-    try:
-        yield TestClient(app)
-    finally:
-        app.dependency_overrides.clear()
+@pytest.fixture
+def client(dashboard_settings):
+    """A TestClient that uses the production per-request dependency."""
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def request_connections(monkeypatch):
+    """Observe real connections without changing their configuration."""
+    connections = []
+    lock = Lock()
+
+    def _open(*args, **kwargs):
+        conn = get_connection(*args, **kwargs)
+        with lock:
+            connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(dashboard_deps, "get_connection", _open)
+    return connections
+
+
+class TestConnectionLifecycle:
+
+    @pytest.mark.parametrize("request_fails", [False, True])
+    def test_dependency_allows_worker_handoffs_and_closes(
+        self, dashboard_settings, request_fails,
+    ):
+        """Setup, query and cleanup need not run on the same worker."""
+        dependency = get_db()
+        with (
+            ThreadPoolExecutor(max_workers=1) as setup_worker,
+            ThreadPoolExecutor(max_workers=1) as cleanup_worker,
+        ):
+            conn = setup_worker.submit(next, dependency).result(timeout=10)
+            try:
+                # The main thread models the endpoint's separate worker.
+                assert conn.execute("SELECT 1").fetchone()[0] == 1
+                if request_fails:
+                    with pytest.raises(RuntimeError, match="request failed"):
+                        cleanup_worker.submit(
+                            dependency.throw, RuntimeError("request failed"),
+                        ).result(timeout=10)
+                else:
+                    assert cleanup_worker.submit(
+                        next, dependency, None,
+                    ).result(timeout=10) is None
+
+                with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                    conn.execute("SELECT 1")
+            finally:
+                # Also release resources if an assertion catches a regression.
+                setup_worker.submit(conn.close).result(timeout=10)
+                setup_worker.submit(dependency.close).result(timeout=10)
+
+    def test_concurrent_requests_use_separate_connections_and_close_them(
+        self, dashboard_settings, request_connections,
+    ):
+        paths = ["/api/health", "/api/overview", "/api/signals"] * 8
+
+        async def _request_batch():
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver",
+            ) as async_client:
+                return await asyncio.gather(
+                    *(async_client.get(path) for path in paths),
+                )
+
+        responses = asyncio.run(_request_batch())
+        assert [response.status_code for response in responses] == [200] * len(paths)
+        assert len(request_connections) == len(paths)
+        assert len({id(conn) for conn in request_connections}) == len(paths)
+        for conn in request_connections:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                conn.execute("SELECT 1")
+
+    def test_endpoint_error_still_closes_connection(
+        self, client, request_connections, monkeypatch,
+    ):
+        def _boom(conn):
+            assert conn.execute("SELECT 1").fetchone()[0] == 1
+            raise RuntimeError("request failed")
+
+        monkeypatch.setattr(dashboard_api, "build_health", _boom)
+        with pytest.raises(RuntimeError, match="request failed"):
+            client.get("/api/health")
+
+        assert len(request_connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            request_connections[0].execute("SELECT 1")
 
 
 def _iso(dt: datetime) -> str:
